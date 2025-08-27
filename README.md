@@ -16,7 +16,7 @@
 
 - 3.在桌面上右键，选择"新建" -> "快捷方式"。在位置字段中输入：
 
-	    pythonw.exe "完整路径\moon_widget\moon_widget.py"
+	    pythonw.exe "完整路径\moon_widget.py"
 
     （将"完整路径"替换为真实文件路径）（实现创建快捷方式功能）
 
