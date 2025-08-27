@@ -29,7 +29,8 @@ class MoonWidget:
         self.moon_events = {}  # 存储月出月落时间
         self.local_tz = pytz.timezone(self.location["timezone"])  # 使用IP所在地的时区
         self.last_update_second = -1  # 记录上一次更新的秒数
-        
+        self.is_topmost = False  # 初始状态为不置顶
+
         # 添加时间戳记录
         self.last_ip_update = 0  # 上次IP更新时间
         self.last_moon_events_update = 0  # 上次月出月落更新时间
@@ -41,7 +42,49 @@ class MoonWidget:
         
         # 初始化Skyfield
         self.init_skyfield_async()
+    
+    def set_topmost(self, topmost):
+        """设置窗口置顶状态"""
+        try:
+            if sys.platform == 'win32':
+                import win32gui
+                import win32con
+                
+                # 如果窗口句柄可用，直接使用
+                if hasattr(self.window, 'hwnd') and self.window.hwnd:
+                    hwnd = self.window.hwnd
+                else:
+                    # 否则通过窗口标题查找
+                    def find_window(hwnd, extra):
+                        if win32gui.GetWindowText(hwnd) == "月球位置":
+                            extra.append(hwnd)
+                        return True
+                    
+                    windows = []
+                    win32gui.EnumWindows(find_window, windows)
+                    
+                    if windows:
+                        hwnd = windows[0]
+                        # 保存句柄以便下次使用
+                        if not hasattr(self.window, 'hwnd'):
+                            self.window.hwnd = hwnd
+                
+                if hwnd:
+                    # 设置窗口置顶属性
+                    win32gui.SetWindowPos(
+                        hwnd,
+                        win32con.HWND_TOPMOST if topmost else win32con.HWND_NOTOPMOST,
+                        0, 0, 0, 0,
+                        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                    )
+                    print(f"窗口置顶状态已设置为: {'置顶' if topmost else '取消置顶'}")
+                    self.is_topmost = topmost
+                    return True
+        except Exception as e:
+            print(f"设置窗口置顶状态失败: {e}")
         
+        return False
+
     def load_last_known_location(self):
         """加载上次已知的位置信息"""
         try:
@@ -920,6 +963,20 @@ class MoonWidget:
                 .close-btn:hover {
                     color: white;
                 }
+                .topmost-btn {
+                    position: absolute;
+                    top: 5px;
+                    right: 30px;  /* 在关闭按钮左侧 */
+                    color: rgba(255, 255, 255, 0.5);
+                    cursor: pointer;
+                    font-size: 16px;
+                }
+                .topmost-btn:hover {
+                    color: white;
+                }
+                .topmost-btn.pinned {
+                    color: gold;
+                }
                 #loading {
                     text-align: center;
                     margin: 20px 0;
@@ -943,7 +1000,8 @@ class MoonWidget:
         <body>
             <div class="close-btn" onclick="window.pywebview.api.close_app()">×</div>
             <div class="network-status" id="network-status">● 在线</div>
-            
+            <div class="topmost-btn" id="topmost-btn" onclick="toggleTopmost()">📌</div>
+
             <div class="header">
                 <h2 style="margin: 0;">🌙 月球位置</h2>
             </div>
@@ -1086,6 +1144,22 @@ class MoonWidget:
                     }
                 }
                 
+                function toggleTopmost() {
+                    const btn = document.getElementById('topmost-btn');
+                    // 先立即更新UI状态，让用户有即时反馈
+                    const isCurrentlyPinned = btn.classList.contains('pinned');
+                    btn.classList.toggle('pinned', !isCurrentlyPinned);
+                    
+                    // 然后调用API设置实际状态
+                    window.pywebview.api.set_topmost(!isCurrentlyPinned).then(function(success) {
+                        if (!success) {
+                            // 如果操作失败，恢复原来的状态
+                            btn.classList.toggle('pinned', isCurrentlyPinned);
+                            console.log('置顶操作失败');
+                        }
+                    });
+                }
+
                 function hideLoading() {
                     document.getElementById('loading').style.display = 'none';
                 }
@@ -1129,7 +1203,7 @@ class MoonWidget:
         )
         
         # 绑定关闭方法
-        self.window.expose(self.close_app)
+        self.window.expose(self.close_app, self.set_topmost)
     
     def close_app(self):
         """关闭应用 - 修改为仅关闭窗口而不是终止进程"""
