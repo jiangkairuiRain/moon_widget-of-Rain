@@ -35,9 +35,45 @@ class MoonWidget:
         self.last_moon_events_update = 0  # 上次月出月落更新时间
         self.last_location = self.location.copy()  # 保存上次位置信息用于比较
         
+        # 添加网络状态和位置记忆功能
+        self.network_available = True  # 默认网络可用
+        self.last_known_location = self.load_last_known_location()  # 加载上次已知位置
+        
         # 初始化Skyfield
         self.init_skyfield_async()
         
+    def load_last_known_location(self):
+        """加载上次已知的位置信息"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), 'moon_widget_config.json')
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    if 'last_known_location' in config:
+                        print("加载上次已知位置信息")
+                        return config['last_known_location']
+        except Exception as e:
+            print(f"加载上次已知位置失败: {e}")
+        return None
+        
+    def save_last_known_location(self):
+        """保存当前已知的位置信息"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), 'moon_widget_config.json')
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+            
+            config['last_known_location'] = self.location
+            
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+                
+            print("保存位置信息到配置文件")
+        except Exception as e:
+            print(f"保存位置信息失败: {e}")
+    
     def init_skyfield_async(self):
         """在后台线程中初始化Skyfield"""
         def init_skyfield():
@@ -126,9 +162,28 @@ class MoonWidget:
                 SKYFIELD_AVAILABLE = False
                 return False
                 
+    def check_network_status(self):
+        """检查网络连接状态"""
+        try:
+            # 尝试连接到一个可靠的网站
+            urlopen('https://www.baidu.com', timeout=3)
+            self.network_available = True
+            return True
+        except:
+            self.network_available = False
+            return False
+            
     def get_public_ip(self):
         """获取本机公网IP地址"""
         try:
+            # 检查网络状态
+            if not self.check_network_status():
+                print("网络不可用，使用上次已知位置")
+                if self.last_known_location:
+                    return self.last_known_location
+                else:
+                    return None
+                    
             # 尝试通过多个服务获取IP，增加成功率
             services = [
                 'https://api.ipify.org',
@@ -161,12 +216,16 @@ class MoonWidget:
                 if os.path.exists(db_path):
                     with geoip2.database.Reader(db_path) as reader:
                         response = reader.city(ip_address)
-                        return {
+                        location_data = {
                             'name': f"{response.city.name if response.city.name else '未知'}, {response.country.name if response.country.name else '未知'}",
                             'latitude': response.location.latitude,
                             'longitude': response.location.longitude,
                             'timezone': response.location.time_zone if response.location.time_zone else 'Asia/Shanghai'
                         }
+                        # 保存为上次已知位置
+                        self.last_known_location = location_data
+                        self.save_last_known_location()
+                        return location_data
             except Exception as e:
                 print(f"使用geoip2数据库失败: {e}")
             
@@ -175,12 +234,16 @@ class MoonWidget:
                 response = requests.get(f'https://ipapi.co/{ip_address}/json/', timeout=3)
                 data = response.json()
                 if 'error' not in data:
-                    return {
+                    location_data = {
                         'name': f"{data.get('city', '未知')}, {data.get('country_name', '未知')}",
                         'latitude': data.get('latitude', 31.2304),
                         'longitude': data.get('longitude', 121.4737),
                         'timezone': data.get('timezone', 'Asia/Shanghai')
                     }
+                    # 保存为上次已知位置
+                    self.last_known_location = location_data
+                    self.save_last_known_location()
+                    return location_data
             except Exception as e:
                 print(f"使用ipapi.co API失败: {e}")
                 
@@ -203,22 +266,37 @@ class MoonWidget:
                     print(f"通过IP获取位置成功: {location['name']}")
                     return location
             
-            # 如果通过IP获取失败，使用默认位置（上海）
+            # 如果通过IP获取失败，尝试使用上次已知位置
+            if self.last_known_location:
+                print(f"使用上次已知位置: {self.last_known_location['name']}")
+                return self.last_known_location
+                
+            # 如果上次已知位置也不可用，使用默认位置（上海）
             print("使用默认位置: 上海")
-            return {
+            default_location = {
                 "name": "上海",
                 "latitude": 31.2304,
                 "longitude": 121.4737,
                 "timezone": "Asia/Shanghai"
             }
+            # 保存默认位置为上次已知位置
+            self.last_known_location = default_location
+            self.save_last_known_location()
+            return default_location
         except Exception as e:
             print(f"获取位置信息错误: {e}")
-            return {
-                "name": "上海",
-                "latitude": 31.2304,
-                "longitude": 121.4737,
-                "timezone": "Asia/Shanghai"
-            }
+            # 尝试使用上次已知位置
+            if self.last_known_location:
+                print(f"发生错误，使用上次已知位置: {self.last_known_location['name']}")
+                return self.last_known_location
+            else:
+                print("发生错误，使用默认位置: 上海")
+                return {
+                    "name": "上海",
+                    "latitude": 31.2304,
+                    "longitude": 121.4737,
+                    "timezone": "Asia/Shanghai"
+                }
     
     def update_location_periodically(self):
         """每10秒更新一次位置信息，如果位置变化则标记需要更新月出月落时间"""
@@ -798,7 +876,7 @@ class MoonWidget:
                     margin: 15px 0;
                     padding: 15px 0;
                     border-top: 1px solid rgba(255, 255, 255, 0.1);
-                    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                    border-bottom: 1px solid rgba(255, 255, 255, 极1);
                 }
                 .event-row {
                     display: flex;
@@ -829,10 +907,23 @@ class MoonWidget:
                     font-size: 12px;
                     color: #aaccff;
                 }
+                .network-status {
+                    position: absolute;
+                    top: 5px;
+                    left: 10px;
+                    font-size: 12px;
+                }
+                .online {
+                    color: #7fff7f;
+                }
+                .offline {
+                    color: #ff7f7f;
+                }
             </style>
         </head>
         <body>
             <div class="close-btn" onclick="window.pywebview.api.close_app()">×</div>
+            <div class="network-status" id="network-status">● 在线</div>
             
             <div class="header">
                 <h2 style="margin: 0;">🌙 月球位置</h2>
@@ -946,7 +1037,7 @@ class MoonWidget:
                     // 更新月相表情
                     const phase = parseFloat(data.phase);
                     let moonEmoji = '🌑'; // 新月
-                    if (phase > 0.9375 || phase <= 0.0625) moonEmoji = '🌑🌑'; // 新月
+                    if (phase > 0.9375 || phase <= 0.0625) moonEmoji = '🌑'; // 新月
                     else if (phase <= 0.1875) moonEmoji = '🌒'; // 娥眉月
                     else if (phase <= 0.3125) moonEmoji = '🌓'; // 上弦月
                     else if (phase <= 0.4375) moonEmoji = '🌔'; // 盈凸月
@@ -961,6 +1052,17 @@ class MoonWidget:
                     const now = new Date();
                     document.getElementById('last-update').textContent = 
                         `最后更新: ${now.toLocaleTimeString()}`;
+                }
+                
+                function updateNetworkStatus(online) {
+                    const statusEl = document.getElementById('network-status');
+                    if (online) {
+                        statusEl.textContent = '● 在线';
+                        statusEl.className = 'network-status online';
+                    } else {
+                        statusEl.textContent = '● 离线 (使用缓存位置)';
+                        statusEl.className = 'network-status offline';
+                    }
                 }
                 
                 function hideLoading() {
