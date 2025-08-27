@@ -601,6 +601,24 @@ class MoonWidget:
         except:
             return "未知"
     
+    def update_network_status(self):
+        """定期更新网络状态并通知界面"""
+        while self.is_running:
+            # 每5秒检查一次网络状态
+            time.sleep(5)
+            
+            # 检查网络状态
+            was_online = self.network_available
+            self.check_network_status()
+            
+            # 如果状态变化，通知界面更新
+            if self.window and was_online != self.network_available:
+                try:
+                    self.window.evaluate_js(f"updateNetworkStatus({json.dumps(self.network_available)})")
+                except Exception as e:
+                    print(f"更新网络状态错误: {e}")
+
+    # 修改 get_moon_data 方法，在返回数据中添加网络状态
     def get_moon_data(self):
         """离线计算月球位置数据"""
         try:
@@ -648,6 +666,7 @@ class MoonWidget:
                 "second_event": self.moon_events["second_event"],
                 "second_time": self.moon_events["second_time"],
                 "visibility": visibility,
+                "online": self.network_available,
                 "timezone": self.location["timezone"]
             }
             
@@ -1052,6 +1071,8 @@ class MoonWidget:
                     const now = new Date();
                     document.getElementById('last-update').textContent = 
                         `最后更新: ${now.toLocaleTimeString()}`;
+                    // 更新网络状态
+                    updateNetworkStatus(data.online);
                 }
                 
                 function updateNetworkStatus(online) {
@@ -1159,6 +1180,11 @@ class MoonWidget:
         update_thread = threading.Thread(target=self.update_moon_data)
         update_thread.daemon = True
         update_thread.start()
+        
+        # 启动网络状态监控线程
+        network_thread = threading.Thread(target=self.update_network_status)
+        network_thread.daemon = True
+        network_thread.start()
         
         # 启动隐藏任务栏图标的线程
         hide_icon_thread = threading.Thread(target=self.hide_taskbar_icon)
