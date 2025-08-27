@@ -221,9 +221,9 @@ class MoonWidget:
             }
     
     def update_location_periodically(self):
-        """每30秒更新一次位置信息，如果位置变化则标记需要更新月出月落时间"""
+        """每10秒更新一次位置信息，如果位置变化则标记需要更新月出月落时间"""
         current_time = time.time()
-        if current_time - self.last_ip_update >= 30:  # 30秒更新一次
+        if current_time - self.last_ip_update >= 10:  # 10秒更新一次
             print("更新位置信息...")
             new_location = self.get_location()
             if new_location:
@@ -489,7 +489,7 @@ class MoonWidget:
         """每3分钟或位置变化时更新月出月落时间"""
         current_time = time.time()
         # 检查是否需要更新月出月落时间（3分钟或位置变化）
-        if (current_time - self.last_moon_events_update >= 180 or  # 3分钟 = 180秒
+        if (current_time - self.last_moon_events_update >= 60 or  # 1分钟 = 60秒
             (self.location["latitude"] != self.last_location["latitude"] or 
              self.location["longitude"] != self.last_location["longitude"] or
              self.location["timezone"] != self.last_location["timezone"])):  # 位置发生变化
@@ -532,7 +532,7 @@ class MoonWidget:
             
             jd = self.julian_day(now_utc)  # 儒略日（使用UTC时间）
             
-            # 定期更新位置信息（每30秒）
+            # 定期更新位置信息（每10秒）
             self.update_location_periodically()
             
             # 定期更新月出月落时间（每3分钟或位置变化时）
@@ -561,8 +561,8 @@ class MoonWidget:
                 "azimuth": f"{moon_pos['azimuth']:.1f}° ({azimuth_direction})",  # 添加方位方向
                 "phase": moon_phase,
                 "location": self.location["name"],
-                "longitude": f"{self.location['longitude']:.4f}°",  # 添加经度显示
-                "latitude": f"{self.location['latitude']:.4f}°",   # 添加纬度显示
+                "longitude": f"{abs(self.location['longitude']):.4f}°{'E' if self.location['longitude'] >= 0 else 'W'}",  # 经度显示，正数为东经(E)，负数为西经(W)
+                "latitude": f"{abs(self.location['latitude']):.4f}°{'N' if self.location['latitude'] >= 0 else 'S'}",    # 纬度显示，正数为北纬(N)，负数为南纬(S)
                 "moonrise": self.moon_events["moonrise"],
                 "moonset": self.moon_events["moonset"],
                 "first_event": self.moon_events["first_event"],
@@ -717,18 +717,18 @@ class MoonWidget:
                 
                 # 窗口尺寸和位置 - 增加高度以确保内容完全显示
                 window_width = 300
-                window_height = 650  # 增加高度以适应内容
+                window_height = 670  # 增加高度以适应内容
                 x = screen_width - window_width - 20  # 右侧留20像素边距
                 y = 100  # 离顶部100像素
             except:
                 # 如果无法获取屏幕尺寸，使用默认值
                 x, y = 100, 100
-                window_width, window_height = 300, 650  # 增加高度以适应内容
+                window_width, window_height = 300, 670  # 增加高度以适应内容
         except Exception as e:
             print(f"窗口创建错误: {e}")
             # 使用安全的默认值
             x, y = 100, 100
-            window_width, window_height = 300, 650  # 增加高度以适应内容
+            window_width, window_height = 300, 670  # 增加高度以适应内容
     
         
         # HTML内容
