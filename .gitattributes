@@ -1,0 +1,21 @@
+# 明确设置批处理文件使用CRLF换行符
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 对于Python文件，可以选择保留原样或指定格式
+*.py text eol=lf
+
+# 对于其他文本文件，可以根据需要设置
+*.txt text
+*.md text
+*.html text
+*.css text
+*.js text
+
+# 二进制文件应该标记为不进行换行符转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
