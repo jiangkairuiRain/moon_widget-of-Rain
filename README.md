@@ -6,7 +6,7 @@
 
 - 1.PS:请提前安装好python和以下库（记得把python加入path）:
 
-        pip install webview pytz requests pywin32 geoip2 -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pip install pywebview pytz requests pywin32 geoip2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 <br>
 
