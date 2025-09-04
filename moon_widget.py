@@ -19,6 +19,21 @@ eph = None
 sun = None
 moon = None
 earth = None
+HIDE_CONSOLE = False  # 新增：控制是否隐藏控制台窗口的全局变量
+
+def hide_console_window():
+    """隐藏控制台窗口"""
+    if HIDE_CONSOLE and sys.platform == 'win32':
+        try:
+            import win32gui
+            import win32con
+            # 获取控制台窗口句柄
+            console_window = win32gui.GetForegroundWindow()
+            # 隐藏控制台窗口
+            win32gui.ShowWindow(console_window, win32con.SW_HIDE)
+            print("控制台窗口已隐藏")
+        except Exception as e:
+            print(f"隐藏控制台窗口失败: {e}")
 
 class MoonWidget:
     def __init__(self):
@@ -42,7 +57,81 @@ class MoonWidget:
         
         # 初始化Skyfield
         self.init_skyfield_async()
-    
+
+        self.eclipse_events = []  # 存储日月食事件
+        self.last_eclipse_update = 0  # 上次日月食更新时间
+        
+        # 添加日月食类型映射
+        self.eclipse_types = {
+            0: "日偏食",
+            1: "日环食",
+            2: "日全食",
+            3: "月偏食",
+            4: "月全食"
+        }
+        
+        # 添加Skyfield初始化状态
+        self.skyfield_error = None
+        
+    def calculate_eclipses(self):
+        """计算未来7天内的日月食事件"""
+        try:
+            global SKYFIELD_AVAILABLE, ts, eph
+            
+            if not SKYFIELD_AVAILABLE:
+                print("Skyfield不可用，无法计算日月食")
+                self.eclipse_events = []
+                return
+                
+            # 检查星历数据是否可用
+            if not self.verify_and_reload_ephemeris():
+                print("星历数据不可用，无法计算日月食")
+                self.eclipse_events = []
+                return
+                
+            # 获取当前时间（UTC）
+            now_utc = datetime.now(timezone.utc)
+            start_time = ts.utc(now_utc)
+            end_time = ts.utc(now_utc + timedelta(days=7))  # 未来7天
+            
+            print(f"查找日月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()}")
+            
+            # 查找日月食事件 - 使用正确的方法名
+            from skyfield import almanac
+            # 检查是否有eclipse_types方法
+            if hasattr(almanac, 'eclipse_types'):
+                t, y = almanac.find_discrete(start_time, end_time, almanac.eclipse_types(eph))
+            else:
+                print("当前Skyfield版本不支持eclipse_types方法")
+                self.eclipse_events = []
+                return
+            
+            print(f"找到 {len(t)} 个日月食事件")
+            
+            eclipse_list = []
+            for i, (time_tt, eclipse_type) in enumerate(zip(t, y)):
+                # 转换时间为本地时区
+                eclipse_time_utc = time_tt.utc_datetime()
+                eclipse_time_local = eclipse_time_utc.replace(tzinfo=timezone.utc).astimezone(self.local_tz)
+                
+                # 格式化事件信息
+                eclipse_info = {
+                    "time": eclipse_time_local.strftime("%m月%d日 %H:%M"),
+                    "type": self.eclipse_types.get(eclipse_type, f"未知类型({eclipse_type})"),
+                    "raw_type": int(eclipse_type)
+                }
+                
+                eclipse_list.append(eclipse_info)
+                print(f"日月食事件: {eclipse_info['time']} - {eclipse_info['type']}")
+            
+            self.eclipse_events = eclipse_list
+            
+        except Exception as e:
+            print(f"计算日月食事件错误: {e}")
+            import traceback
+            traceback.print_exc()
+            self.eclipse_events = []
+
     def set_topmost(self, topmost):
         """设置窗口置顶状态"""
         try:
@@ -108,7 +197,9 @@ class MoonWidget:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
             
-            config['last_known_location'] = self.location
+            # 确保self.location存在
+            if hasattr(self, 'location') and self.location:
+                config['last_known_location'] = self.location
             
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -149,10 +240,12 @@ class MoonWidget:
                     
             except ImportError:
                 SKYFIELD_AVAILABLE = False
-                print("skyfield库未安装，将使用简化算法计算月出月落时间")
-                print("要获得更精确的结果，请安装: pip install skyfield")
+                self.skyfield_error = "skyfield库未安装，无法计算精确数据"
+                print("skyfield库未安装，无法计算精确数据")
+                print("要获得精确结果，请安装: pip install skyfield")
             except Exception as e:
                 SKYFIELD_AVAILABLE = False
+                self.skyfield_error = f"加载skyfield时出错: {e}"
                 print(f"加载skyfield时出错: {e}")
         
         # 在后台线程中初始化Skyfield
@@ -401,8 +494,16 @@ class MoonWidget:
             # 检查是否找到事件
             if len(times) == 0:
                 print("警告: 未找到月出月落事件，可能处于极地地区或计算时间范围不足")
-                # 使用简化算法作为备选
-                self.calculate_moon_events_simple()
+                self.moon_events = {
+                    "moonrise": "--:--",
+                    "moonset": "--:--",
+                    "first_event": "月出",
+                    "first_time": "未找到",
+                    "second_event": "月落",
+                    "second_time": "未找到",
+                    "moonrise_dt": None,
+                    "moonset_dt": None
+                }
                 return
                 
             # 提取月出和月落时间
@@ -505,111 +606,58 @@ class MoonWidget:
             print(f"使用skyfield计算月出月落时间错误: {e}")
             import traceback
             traceback.print_exc()  # 打印完整的错误堆栈
-            # 回退到简化算法
-            self.calculate_moon_events_simple()
-    
-    def calculate_moon_events_simple(self):
-        """简化算法计算月出月落时间（备用方法）"""
-        try:
-            # 获取当前日期（使用本地时区）- 修复：使用有时区的时间
-            now_utc = datetime.now(timezone.utc)
-            local_now = now_utc.astimezone(self.local_tz)  # 使用本地时区
             
-            # 计算儒略日
-            jd = self.julian_day(now_utc)
-            
-            # 基于月球每天延迟约50分钟升起的事实
-            days_since_new_moon = jd % 29.53
-            moonrise_delay_minutes = 50 * days_since_new_moon
-            
-            # 计算月出时间（本地时区）
-            moonrise_hour = (12 + moonrise_delay_minutes / 60) % 24
-            moonrise_minute = (moonrise_hour - int(moonrise_hour)) * 60
-            
-            # 创建月出时间（使用本地时间）
-            moonrise_time = local_now.replace(
-                hour=int(moonrise_hour), 
-                minute=int(moonrise_minute), 
-                second=0, 
-                microsecond=0
-            )
-            
-            # 月落时间大约是月出时间后12小时50分钟
-            moonset_time = moonrise_time + timedelta(hours=12, minutes=50)
-            
-            # 如果月出时间已经过去，计算下一次月出时间
-            if moonrise_time < local_now:
-                moonrise_time += timedelta(days=1)
-                moonset_time += timedelta(days=1)
-            
-            # 如果月落时间已经过去，计算下一次月落时间
-            if moonset_time < local_now:
-                moonset_time += timedelta(days=1)
-            
-            # 格式化时间
-            moonrise_str = moonrise_time.strftime("%H:%M")
-            moonset_str = moonset_time.strftime("%H:%M")
-            
-            # 修复：确保月出月落时间显示顺序正确
-            # 确定显示顺序 - 根据时间先后顺序
-            if moonrise_time < moonset_time:
-                first_event = "月出"
-                first_time = moonrise_time.strftime("%m月%d日 %H:%M")
-                second_event = "月落"
-                second_time = moonset_time.strftime("%m月%d日 %H:%M")
-            else:
-                first_event = "月落"
-                first_time = moonset_time.strftime("%m月%d日 %H:%M")
-                second_event = "月出"
-                second_time = moonrise_time.strftime("%m月%d日 %H:%M")
-            
-            self.moon_events = {
-                "moonrise": moonrise_str,
-                "moonset": moonset_str,
-                "first_event": first_event,
-                "first_time": first_time,
-                "second_event": second_event,
-                "second_time": second_time,
-                "moonrise_dt": moonrise_time,
-                "moonset_dt": moonset_time
-            }
-            
-            print(f"使用简化算法计算月出月落时间: 月出 {self.moon_events['moonrise']}, 月落 {self.moon_events['moonset']}")
-            print(f"显示顺序: {first_event} {first_time}, {second_event} {second_time}")
-            
-        except Exception as e:
-            print(f"简化算法计算月出月落时间错误: {e}")
+            # 设置错误信息
             self.moon_events = {
                 "moonrise": "--:--",
                 "moonset": "--:--",
                 "first_event": "月出",
-                "first_time": "--",
+                "first_time": "计算错误",
                 "second_event": "月落",
-                "second_time": "--",
+                "second_time": "计算错误",
                 "moonrise_dt": None,
                 "moonset_dt": None
             }
     
     def calculate_moon_events(self):
-        """计算月出和月落时间 - 优先使用skyfield库"""
+        """计算月出和月落时间 - 只使用skyfield库"""
         global SKYFIELD_AVAILABLE
         
         # 验证星历数据
         if SKYFIELD_AVAILABLE:
             if not self.verify_and_reload_ephemeris():
-                print("星历数据不可用，使用简化算法")
-                self.calculate_moon_events_simple()
+                print("星历数据不可用，无法计算月出月落")
+                self.moon_events = {
+                    "moonrise": "--:--",
+                    "moonset": "--:--",
+                    "first_event": "月出",
+                    "first_time": "星历数据不可用",
+                    "second_event": "月落",
+                    "second_time": "星历数据不可用",
+                    "moonrise_dt": None,
+                    "moonset_dt": None
+                }
                 return
         
         if SKYFIELD_AVAILABLE:
             self.calculate_moon_events_with_skyfield()
         else:
-            self.calculate_moon_events_simple()
+            # Skyfield不可用，设置错误信息
+            self.moon_events = {
+                "moonrise": "--:--",
+                "moonset": "--:--",
+                "first_event": "月出",
+                "first_time": "需要安装skyfield库",
+                "second_event": "月落",
+                "second_time": "需要安装skyfield库",
+                "moonrise_dt": None,
+                "moonset_dt": None
+            }
     
     def update_moon_events_periodically(self):
-        """每3分钟或位置变化时更新月出月落时间"""
+        """每1分钟或位置变化时更新月出月落时间"""
         current_time = time.time()
-        # 检查是否需要更新月出月落时间（3分钟或位置变化）
+        # 检查是否需要更新月出月落时间（1分钟或位置变化）
         if (current_time - self.last_moon_events_update >= 60 or  # 1分钟 = 60秒
             (self.location["latitude"] != self.last_location["latitude"] or 
              self.location["longitude"] != self.last_location["longitude"] or
@@ -619,6 +667,11 @@ class MoonWidget:
             self.calculate_moon_events()
             self.last_moon_events_update = current_time
             self.last_location = self.location.copy()  # 更新上次位置信息
+        
+        if current_time - self.last_eclipse_update >= 21600:  # 6小时 = 21600秒
+            print("更新日月食信息...")
+            self.calculate_eclipses()
+            self.last_eclipse_update = current_time
     
     def get_azimuth_direction(self, azimuth):
         """将方位角转换为方向（东、南、西、北等）"""
@@ -661,15 +714,56 @@ class MoonWidget:
                 except Exception as e:
                     print(f"更新网络状态错误: {e}")
 
+    def calculate_moon_position_with_skyfield(self):
+        """使用Skyfield计算月球位置"""
+        try:
+            global SKYFIELD_AVAILABLE, ts, eph, moon, earth
+            
+            if not SKYFIELD_AVAILABLE:
+                raise ImportError("skyfield库不可用")
+                
+            # 检查星历数据是否加载成功
+            if eph is None:
+                raise Exception("星历数据未加载")
+                
+            # 获取当前时间（UTC）
+            now_utc = datetime.now(timezone.utc)
+            t = ts.utc(now_utc)
+            
+            # 创建观察者位置
+            from skyfield.api import wgs84
+            observer = wgs84.latlon(self.location["latitude"], self.location["longitude"])
+            
+            # 计算月球位置（相对于观察者）- 修复方法调用
+            apparent = (earth + observer).at(t).observe(moon).apparent()
+            
+            # 获取赤经和赤纬
+            ra, dec, distance = apparent.radec()
+            
+            # 获取高度角和方位角
+            alt, az, _ = apparent.altaz()
+            
+            return {
+                "ra": ra.hours,
+                "dec": dec.degrees,
+                "distance": distance.km,
+                "altitude": alt.degrees,
+                "azimuth": az.degrees
+            }
+            
+        except Exception as e:
+            print(f"使用Skyfield计算月球位置错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     # 修改 get_moon_data 方法，在返回数据中添加网络状态
     def get_moon_data(self):
-        """离线计算月球位置数据"""
+        """获取月球数据 - 使用Skyfield计算"""
         try:
             # 使用UTC时间进行计算 - 修复：使用有时区的时间
             now_utc = datetime.now(timezone.utc)
             now_local = now_utc.astimezone(self.local_tz)  # 使用本地时区
-            
-            jd = self.julian_day(now_utc)  # 儒略日（使用UTC时间）
             
             # 定期更新位置信息（每10秒）
             self.update_location_periodically()
@@ -677,11 +771,25 @@ class MoonWidget:
             # 定期更新月出月落时间（每3分钟或位置变化时）
             self.update_moon_events_periodically()
             
-            # 计算月球位置（改进的计算）
-            moon_pos = self.calculate_moon_position(jd, now_utc)
+            # 计算月球位置（使用Skyfield）
+            moon_pos = None
+            if SKYFIELD_AVAILABLE:
+                moon_pos = self.calculate_moon_position_with_skyfield()
+            
+            # 如果Skyfield计算失败，返回错误信息
+            if moon_pos is None:
+                moon_pos = {
+                    "ra": 0,
+                    "dec": 0,
+                    "distance": 0,
+                    "altitude": 0,
+                    "azimuth": 0
+                }
+            
             self.last_moon_pos = moon_pos  # 保存最后一次计算的位置
             
             # 计算月相
+            jd = self.julian_day(now_utc)  # 儒略日（使用UTC时间）
             moon_phase = self.calculate_moon_phase(jd)
             
             # 获取方位角方向
@@ -710,7 +818,10 @@ class MoonWidget:
                 "second_time": self.moon_events["second_time"],
                 "visibility": visibility,
                 "online": self.network_available,
-                "timezone": self.location["timezone"]
+                "timezone": self.location["timezone"],
+                "eclipses": self.eclipse_events,
+                "skyfield_available": SKYFIELD_AVAILABLE,
+                "skyfield_error": self.skyfield_error
             }
             
             return moon_data
@@ -728,96 +839,6 @@ class MoonWidget:
         jd = jdn + (dt.hour - 12) / 24.0 + dt.minute / 1440.0 + dt.second / 86400.0
         
         return jd
-    
-    def calculate_moon_position(self, jd, dt_utc):
-        """改进计算月球位置，考虑当地经纬度"""
-        # 基于更精确的算法计算月球位置
-        
-        # 计算时间参数（以世纪为单位）
-        T = (jd - 2451545.0) / 36525.0
-        
-        # 月球平黄经
-        Lp = 218.3164477 + 481267.88123421 * T - 0.0015786 * T**2 + T**3 / 538841 - T**4 / 65194000
-        Lp = Lp % 360
-        
-        # 月球平近点角
-        M = 134.96298139 + 477198.86739806 * T + 0.0086972 * T**2 + T**3 / 56250
-        M = math.radians(M % 360)
-        
-        # 太阳平近点角
-        Mprime = 357.52772333 + 35999.05034 * T - 0.0001603 * T**2 - T**3 / 300000
-        Mprime = math.radians(Mprime % 360)
-        
-        # 月球升交点平黄经
-        Omega = 125.04455501 - 1934.13618488 * T + 0.0020762 * T**2 + T**3 / 467410 - T**4 / 60616000
-        Omega = math.radians(Omega % 360)
-        
-        # 计算月球经度
-        # 主要周期项
-        l = math.radians(Lp) + math.radians(6.288774 * math.sin(M) + 
-                                          1.274018 * math.sin(2 * math.radians(Lp) - M) +
-                                          0.658309 * math.sin(2 * math.radians(Lp)) +
-                                          0.213616 * math.sin(2 * M) -
-                                          0.185596 * math.sin(Mprime) -
-                                          0.114336 * math.sin(2 * Omega))
-        
-        # 计算月球纬度
-        b = math.radians(5.128189 * math.sin(Omega) +
-                        0.280606 * math.sin(M + Omega) +
-                        0.277693 * math.sin(M - Omega) +
-                        0.173238 * math.sin(2 * math.radians(Lp) - Omega))
-        
-        # 计算距离（千米）
-        distance = 385000.56 + 20905.355 * math.cos(M) + 3699.111 * math.cos(2 * math.radians(Lp) - M) + 2955.967 * math.cos(2 * math.radians(Lp))
-        
-        # 转换为赤道坐标
-        # 黄赤交角
-        epsilon = math.radians(23.4392911 - 0.0130042 * T)
-        
-        # 赤经
-        ra = math.atan2(math.sin(l) * math.cos(epsilon) - math.tan(b) * math.sin(epsilon), math.cos(l))
-        if ra < 0:
-            ra += 2 * math.pi
-        ra = math.degrees(ra) / 15  # 转换为小时
-        
-        # 赤纬
-        dec = math.asin(math.sin(b) * math.cos(epsilon) + math.cos(b) * math.sin(epsilon) * math.sin(l))
-        dec = math.degrees(dec)
-        
-        # 计算高度角和方位角（考虑当地经纬度）
-        # 地方恒星时
-        gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * T**2 - T**3 / 38710000
-        gmst = gmst % 360
-        
-        # 计算时角
-        ha = (gmst + self.location["longitude"] - ra * 15) % 360
-        if ha > 180:
-            ha -= 360
-        
-        # 转换为弧度
-        ha_rad = math.radians(ha)
-        dec_rad = math.radians(dec)
-        lat_rad = math.radians(self.location["latitude"])
-        
-        # 计算高度角
-        sin_alt = math.sin(lat_rad) * math.sin(dec_rad) + math.cos(lat_rad) * math.cos(dec_rad) * math.cos(ha_rad)
-        alt = math.degrees(math.asin(sin_alt))
-        
-        # 计算方位角
-        cos_az = (math.sin(dec_rad) - math.sin(lat_rad) * sin_alt) / (math.cos(lat_rad) * math.cos(math.radians(alt)))
-        az = math.degrees(math.acos(cos_az))
-        
-        # 调整方位角
-        if math.sin(ha_rad) > 0:
-            az = 360 - az
-        
-        return {
-            "ra": ra,
-            "dec": dec,
-            "distance": distance,
-            "altitude": alt,
-            "azimuth": az
-        }
     
     def calculate_moon_phase(self, jd):
         """计算月相(0=新月, 0.5=满月)"""
@@ -857,18 +878,18 @@ class MoonWidget:
                 
                 # 窗口尺寸和位置 - 增加高度以确保内容完全显示
                 window_width = 300
-                window_height = 670  # 增加高度以适应内容
+                window_height = 750  # 增加高度以适应内容
                 x = screen_width - window_width - 20  # 右侧留20像素边距
                 y = 100  # 离顶部100像素
             except:
                 # 如果无法获取屏幕尺寸，使用默认值
                 x, y = 100, 100
-                window_width, window_height = 300, 670  # 增加高度以适应内容
+                window_width, window_height = 300, 750  # 增加高度以适应内容
         except Exception as e:
             print(f"窗口创建错误: {e}")
             # 使用安全的默认值
             x, y = 100, 100
-            window_width, window_height = 300, 670  # 增加高度以适应内容
+            window_width, window_height = 300, 750  # 增加高度以适应内容
     
         
         # HTML内容
@@ -889,7 +910,7 @@ class MoonWidget:
                     -webkit-backdrop-filter: blur(5px);
                     overflow: hidden;
                     border: 1px solid rgba(255, 255, 255, 0.1);
-                    height: 620px; /* 增加高度以适应内容 */
+                    height: 750px; /* 增加高度以适应内容 */
                     box-sizing: border-box;
                 }
                 .header {
@@ -938,7 +959,7 @@ class MoonWidget:
                     margin: 15px 0;
                     padding: 15px 0;
                     border-top: 1px solid rgba(255, 255, 255, 0.1);
-                    border-bottom: 1px solid rgba(255, 255, 255, 极1);
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
                 }
                 .event-row {
                     display: flex;
@@ -950,12 +971,12 @@ class MoonWidget:
                     text-align: center;
                     margin-top: 15px;
                     font-size: 10px;
-                    color: rgba(255, 255, 255, 0.5);
+                    color: rgba(255, 255, 255, 5);
                 }
                 .close-btn {
                     position: absolute;
                     top: 5px;
-                    right: 10px;
+                    right: 10;
                     color: rgba(255, 255, 255, 0.5);
                     cursor: pointer;
                     font-size: 16px;
@@ -995,6 +1016,46 @@ class MoonWidget:
                 .offline {
                     color: #ff7f7f;
                 }
+                .eclipse-section {
+                    margin: 15px 0;
+                    padding: 15px 0;
+                    border-top: 1px solid rgba(255, 255, 255, 0.1);
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                    max-height: 120px; /* 限制高度 */
+                    overflow-y: auto;  /* 添加滚动条 */
+                }
+                .eclipse-header {
+                    text-align: center;
+                    font-weight: bold;
+                    margin-bottom: 8px;
+                    color: #aaccff;
+                }
+                .eclipse-item {
+                    font-size: 11px;
+                    margin-bottom: 5px;
+                    display: flex;
+                    justify-content: space-between;
+                }
+                .eclipse-time {
+                    color: #ffff7f;
+                }
+                .eclipse-type {
+                    color: #ff7f7f;
+                }
+                .no-eclipse {
+                    text-align: center;
+                    font-size: 11px;
+                    color: rgba(255, 255, 255, 0.5);
+                }
+                .skyfield-error {
+                    text-align: center;
+                    margin: 10px 0;
+                    padding: 10px;
+                    background-color: rgba(255, 0, 0, 0.2);
+                    border-radius: 5px;
+                    font-size: 11px;
+                    color: #ff7f7f;
+                }
             </style>
         </head>
         <body>
@@ -1010,6 +1071,8 @@ class MoonWidget:
                 正在初始化...<br>
                 <span id="loading-status">加载中，请稍候...</span>
             </div>
+            
+            <div id="skyfield-error" class="skyfield-error" style="display: none;"></div>
             
             <div class="location">
                 位置: <span id="location">--</span>
@@ -1076,10 +1139,53 @@ class MoonWidget:
             
             <div class="last-update" id="last-update">最后更新: --</div>
             
+            <div class="eclipse-section">
+                <div class="eclipse-header">未来7天日月食</div>
+                <div id="eclipse-list">
+                    <div class="no-eclipse">加载中...</div>
+                </div>
+            </div>
+
             <script>
+                function updateEclipseData(eclipses) {
+                    const eclipseList = document.getElementById('eclipse-list');
+                    
+                    if (eclipses.length === 0) {
+                        eclipseList.innerHTML = '<div class="no-eclipse">未来7天内无日月食事件</div>';
+                        return;
+                    }
+                    
+                    let html = '';
+                    eclipses.forEach(eclipse => {
+                        // 根据类型设置不同的图标
+                        let icon = '🌙'; // 默认月亮
+                        if (eclipse.raw_type < 3) { // 日食
+                            icon = '☀️';
+                        }
+                        
+                        html += `
+                            <div class="eclipse-item">
+                                <span class="eclipse-time">${icon} ${eclipse.time}</span>
+                                <span class="eclipse-type">${eclipse.type}</span>
+                            </div>
+                        `;
+                    });
+                    
+                    eclipseList.innerHTML = html;
+                }
+
                 function updateMoonData(data) {
                     // 隐藏加载提示
                     document.getElementById('loading').style.display = 'none';
+                    
+                    // 显示或隐藏Skyfield错误信息
+                    const errorEl = document.getElementById('skyfield-error');
+                    if (data.skyfield_available) {
+                        errorEl.style.display = 'none';
+                    } else {
+                        errorEl.style.display = 'block';
+                        errorEl.textContent = data.skyfield_error || 'Skyfield不可用，部分功能受限';
+                    }
                     
                     document.getElementById('location').textContent = data.location;
                     document.getElementById('longitude').textContent = data.longitude;
@@ -1125,6 +1231,9 @@ class MoonWidget:
                     
                     document.getElementById('moon-phase').textContent = moonEmoji;
                     
+                    // 更新日月食信息
+                    updateEclipseData(data.eclipses || []);
+
                     // 更新最后更新时间
                     const now = new Date();
                     document.getElementById('last-update').textContent = 
@@ -1164,6 +1273,8 @@ class MoonWidget:
                     document.getElementById('loading').style.display = 'none';
                 }
                 
+                
+
                 // 初始显示
                 updateMoonData({
                     location: "获取中...",
@@ -1181,7 +1292,8 @@ class MoonWidget:
                     second_event: "月落",
                     second_time: "--",
                     visibility: "--",
-                    phase: 0
+                    phase: 0,
+                    skyfield_available: true
                 });
             </script>
         </body>
@@ -1255,7 +1367,7 @@ class MoonWidget:
         update_thread.daemon = True
         update_thread.start()
         
-        # 启动网络状态监控线程
+        # 启动网络状态监控极线程
         network_thread = threading.Thread(target=self.update_network_status)
         network_thread.daemon = True
         network_thread.start()
@@ -1269,20 +1381,16 @@ class MoonWidget:
         webview.start(debug=False)
 
 if __name__ == '__main__':
+    # 如果设置了隐藏控制台，则尝试隐藏
+    if HIDE_CONSOLE:
+        hide_console_window()
+    
     # 设置为后台运行，不显示控制台窗口
     if sys.executable.endswith("pythonw.exe"):
         # 如果使用pythonw运行，已经是后台模式
         widget = MoonWidget()
         widget.run()
     else:
-        # 如果使用python运行，尝试隐藏控制台窗口
-        try:
-            import win32gui
-            import win32con
-            # 隐藏控制台窗口
-            win32gui.ShowWindow(win32gui.GetForegroundWindow(), win32con.SW_HIDE)
-        except:
-            pass
-        
+        # 如果使用python运行，根据全局变量决定是否隐藏控制台
         widget = MoonWidget()
         widget.run()
