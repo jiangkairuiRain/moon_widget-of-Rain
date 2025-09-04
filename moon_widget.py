@@ -19,7 +19,7 @@ eph = None
 sun = None
 moon = None
 earth = None
-HIDE_CONSOLE = False  # 新增：控制是否隐藏控制台窗口的全局变量
+HIDE_CONSOLE = True  # 新增：控制是否隐藏控制台窗口的全局变量
 
 def hide_console_window():
     """隐藏控制台窗口"""
@@ -976,7 +976,7 @@ class MoonWidget:
                 .close-btn {
                     position: absolute;
                     top: 5px;
-                    right: 10;
+                    right: 10px;
                     color: rgba(255, 255, 255, 0.5);
                     cursor: pointer;
                     font-size: 16px;
@@ -1138,9 +1138,10 @@ class MoonWidget:
             </div>
             
             <div class="last-update" id="last-update">最后更新: --</div>
-            
+
+            <!-- 暂时不显示有关日食月食的标题和内容 -->
             <div class="eclipse-section">
-                <div class="eclipse-header">未来7天日月食</div>
+                <div class="eclipse-header"> </div>
                 <div id="eclipse-list">
                     <div class="no-eclipse">加载中...</div>
                 </div>
@@ -1151,7 +1152,7 @@ class MoonWidget:
                     const eclipseList = document.getElementById('eclipse-list');
                     
                     if (eclipses.length === 0) {
-                        eclipseList.innerHTML = '<div class="no-eclipse">未来7天内无日月食事件</div>';
+                        eclipseList.innerHTML = '<div class="no-eclipse"> </div>';
                         return;
                     }
                     
