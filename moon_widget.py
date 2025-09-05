@@ -19,7 +19,7 @@ eph = None
 sun = None
 moon = None
 earth = None
-HIDE_CONSOLE = True  # 新增：控制是否隐藏控制台窗口的全局变量
+HIDE_CONSOLE = False  # 新增：控制是否隐藏控制台窗口的全局变量
 
 def hide_console_window():
     """隐藏控制台窗口"""
@@ -40,6 +40,12 @@ class MoonWidget:
         self.window = None
         self.update_interval = 1  # 更新间隔改为1秒
         self.is_running = True
+        
+        # 先初始化网络状态和位置记忆功能
+        self.network_available = True  # 默认网络可用
+        self.last_known_location = self.load_last_known_location()  # 加载上次已知位置
+        
+        # 然后获取位置信息
         self.location = self.get_location()  # 获取位置信息
         self.moon_events = {}  # 存储月出月落时间
         self.local_tz = pytz.timezone(self.location["timezone"])  # 使用IP所在地的时区
@@ -51,10 +57,6 @@ class MoonWidget:
         self.last_moon_events_update = 0  # 上次月出月落更新时间
         self.last_location = self.location.copy()  # 保存上次位置信息用于比较
         
-        # 添加网络状态和位置记忆功能
-        self.network_available = True  # 默认网络可用
-        self.last_known_location = self.load_last_known_location()  # 加载上次已知位置
-        
         # 初始化Skyfield
         self.init_skyfield_async()
 
@@ -63,9 +65,6 @@ class MoonWidget:
         
         # 添加日月食类型映射
         self.eclipse_types = {
-            0: "日偏食",
-            1: "日环食",
-            2: "日全食",
             3: "月偏食",
             4: "月全食"
         }
@@ -73,19 +72,63 @@ class MoonWidget:
         # 添加Skyfield初始化状态
         self.skyfield_error = None
         
+    def calculate_lunar_eclipses(self, start_time, end_time):
+        """计算月食事件"""
+        try:
+            from skyfield import eclipselib
+            
+            # 计算月食
+            t, y, details = eclipselib.lunar_eclipses(start_time, end_time, eph)
+            
+            eclipses = []
+            for ti, yi in zip(t, y):
+                # 转换时间为本地时区
+                eclipse_time_utc = ti.utc_datetime()
+                eclipse_time_local = eclipse_time_utc.replace(tzinfo=timezone.utc).astimezone(self.local_tz)
+                
+                # 获取月食类型
+                if yi == 0:
+                    eclipse_type = "半影月食"
+                elif yi == 1:
+                    eclipse_type = "月偏食"
+                elif yi == 2:
+                    eclipse_type = "月全食"
+                else:
+                    eclipse_type = f"未知月食({yi})"
+                
+                # 格式化事件信息
+                eclipse_info = {
+                    "time": eclipse_time_local.strftime("%m月%d日 %H:%M"),
+                    "type": eclipse_type,
+                    "raw_type": int(yi) + 3,  # 月食类型从3开始
+                    "time_utc": eclipse_time_utc.isoformat(),  # 转换为字符串
+                    "is_lunar": True
+                }
+                
+                eclipses.append(eclipse_info)
+                print(f"月食事件: {eclipse_info['time']} - {eclipse_info['type']}")
+            
+            return eclipses
+            
+        except Exception as e:
+            print(f"计算月食事件错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+        
     def calculate_eclipses(self):
-        """计算未来7天内的日月食事件"""
+        """计算未来7天内的月食事件"""
         try:
             global SKYFIELD_AVAILABLE, ts, eph
             
             if not SKYFIELD_AVAILABLE:
-                print("Skyfield不可用，无法计算日月食")
+                print("Skyfield不可用，无法计算月食")
                 self.eclipse_events = []
                 return
                 
             # 检查星历数据是否可用
             if not self.verify_and_reload_ephemeris():
-                print("星历数据不可用，无法计算日月食")
+                print("星历数据不可用，无法计算月食")
                 self.eclipse_events = []
                 return
                 
@@ -94,40 +137,20 @@ class MoonWidget:
             start_time = ts.utc(now_utc)
             end_time = ts.utc(now_utc + timedelta(days=7))  # 未来7天
             
-            print(f"查找日月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()}")
+            print(f"查找月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()}")
             
-            # 查找日月食事件 - 使用正确的方法名
-            from skyfield import almanac
-            # 检查是否有eclipse_types方法
-            if hasattr(almanac, 'eclipse_types'):
-                t, y = almanac.find_discrete(start_time, end_time, almanac.eclipse_types(eph))
-            else:
-                print("当前Skyfield版本不支持eclipse_types方法")
-                self.eclipse_events = []
-                return
+            # 计算月食
+            lunar_eclipses = self.calculate_lunar_eclipses(start_time, end_time)
             
-            print(f"找到 {len(t)} 个日月食事件")
+            # 限制显示数量，最多显示5个
+            lunar_eclipses = lunar_eclipses[:5]
             
-            eclipse_list = []
-            for i, (time_tt, eclipse_type) in enumerate(zip(t, y)):
-                # 转换时间为本地时区
-                eclipse_time_utc = time_tt.utc_datetime()
-                eclipse_time_local = eclipse_time_utc.replace(tzinfo=timezone.utc).astimezone(self.local_tz)
-                
-                # 格式化事件信息
-                eclipse_info = {
-                    "time": eclipse_time_local.strftime("%m月%d日 %H:%M"),
-                    "type": self.eclipse_types.get(eclipse_type, f"未知类型({eclipse_type})"),
-                    "raw_type": int(eclipse_type)
-                }
-                
-                eclipse_list.append(eclipse_info)
-                print(f"日月食事件: {eclipse_info['time']} - {eclipse_info['type']}")
+            print(f"找到 {len(lunar_eclipses)} 个月食事件")
             
-            self.eclipse_events = eclipse_list
+            self.eclipse_events = lunar_eclipses
             
         except Exception as e:
-            print(f"计算日月食事件错误: {e}")
+            print(f"计算月食事件错误: {e}")
             import traceback
             traceback.print_exc()
             self.eclipse_events = []
@@ -218,6 +241,23 @@ class MoonWidget:
                 
                 # 指定本地星历表文件路径
                 de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
+                
+                # 检查网络状态，如果网络不可用，只尝试从本地加载
+                if not self.network_available:
+                    if os.path.exists(de421_path):
+                        print("网络不可用，从本地加载星历数据...")
+                        ts = load.timescale()
+                        eph = load(de421_path)
+                        sun, moon, earth = eph['sun'], eph['moon'], eph['earth']
+                        SKYFIELD_AVAILABLE = True
+                        print("从本地加载星历数据成功")
+                    else:
+                        SKYFIELD_AVAILABLE = False
+                        self.skyfield_error = "网络不可用且本地无星历数据文件"
+                        print("网络不可用且本地无星历数据文件，Skyfield初始化失败")
+                    return
+                
+                # 网络可用时，尝试从本地加载，失败则从网络下载
                 if os.path.exists(de421_path):
                     print("从本地加载星历数据...")
                     ts = load.timescale()
@@ -237,7 +277,7 @@ class MoonWidget:
                         self.window.evaluate_js("document.getElementById('loading-status').textContent = 'Skyfield初始化完成';")
                     except:
                         pass
-                    
+                        
             except ImportError:
                 SKYFIELD_AVAILABLE = False
                 self.skyfield_error = "skyfield库未安装，无法计算精确数据"
@@ -265,7 +305,7 @@ class MoonWidget:
             # 尝试使用星历数据进行简单计算
             from skyfield.api import load
             test_ts = load.timescale()
-            test_time = test_ts.utc(datetime.now(timezone.utc))  # 修复：使用有时区的时间
+            test_time = test_ts.utc(datetime.now(timezone.utc))
             
             # 尝试计算月球位置
             astrometric = eph['earth'].at(test_time).observe(eph['moon'])
@@ -283,11 +323,20 @@ class MoonWidget:
                 # 尝试重新加载星历数据
                 de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
                 if os.path.exists(de421_path):
+                    # 从本地加载
+                    from skyfield.api import load
                     ts = load.timescale()
                     eph = load(de421_path)
-                else:
+                elif self.network_available:
+                    # 只有网络可用时才尝试从网络下载
+                    from skyfield.api import load
                     ts = load.timescale()
                     eph = load('de421.bsp')
+                else:
+                    # 网络不可用且本地无星历数据文件
+                    print("无法加载星历数据: 网络不可用且本地无星历数据文件")
+                    SKYFIELD_AVAILABLE = False
+                    return False
                     
                 sun, moon, earth = eph['sun'], eph['moon'], eph['earth']
                 SKYFIELD_AVAILABLE = True
@@ -303,10 +352,28 @@ class MoonWidget:
         try:
             # 尝试连接到一个可靠的网站
             urlopen('https://www.baidu.com', timeout=3)
+            was_offline = not self.network_available
             self.network_available = True
+            
+            # 如果之前是离线状态，现在恢复在线，重新初始化Skyfield
+            if was_offline:
+                print("网络恢复，重新初始化Skyfield...")
+                self.init_skyfield_async()
+                
             return True
         except:
+            was_online = self.network_available
             self.network_available = False
+            
+            # 如果之前是在线状态，现在变为离线，尝试使用本地星历数据
+            if was_online:
+                print("网络断开，尝试使用本地星历数据...")
+                # 检查本地是否有星历数据文件
+                de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
+                if os.path.exists(de421_path):
+                    print("找到本地星历数据文件，尝试加载...")
+                    self.init_skyfield_async()
+            
             return False
             
     def get_public_ip(self):
@@ -403,7 +470,7 @@ class MoonWidget:
                     return location
             
             # 如果通过IP获取失败，尝试使用上次已知位置
-            if self.last_known_location:
+            if hasattr(self, 'last_known_location') and self.last_known_location:
                 print(f"使用上次已知位置: {self.last_known_location['name']}")
                 return self.last_known_location
                 
@@ -422,7 +489,7 @@ class MoonWidget:
         except Exception as e:
             print(f"获取位置信息错误: {e}")
             # 尝试使用上次已知位置
-            if self.last_known_location:
+            if hasattr(self, 'last_known_location') and self.last_known_location:
                 print(f"发生错误，使用上次已知位置: {self.last_known_location['name']}")
                 return self.last_known_location
             else:
@@ -454,6 +521,8 @@ class MoonWidget:
                     self.local_tz = pytz.timezone(self.location["timezone"])
                     # 位置变化时需要重新计算月出月落
                     self.last_moon_events_update = 0  # 强制下次更新月出月落
+                    # 位置变化时也需要更新月食信息
+                    self.last_eclipse_update = 0  # 新增：强制下次更新月食信息
                     self.last_location = self.location.copy()  # 更新上次位置信息
             self.last_ip_update = current_time
     
@@ -623,53 +692,64 @@ class MoonWidget:
         """计算月出和月落时间 - 只使用skyfield库"""
         global SKYFIELD_AVAILABLE
         
-        # 验证星历数据
-        if SKYFIELD_AVAILABLE:
-            if not self.verify_and_reload_ephemeris():
-                print("星历数据不可用，无法计算月出月落")
-                self.moon_events = {
-                    "moonrise": "--:--",
-                    "moonset": "--:--",
-                    "first_event": "月出",
-                    "first_time": "星历数据不可用",
-                    "second_event": "月落",
-                    "second_time": "星历数据不可用",
-                    "moonrise_dt": None,
-                    "moonset_dt": None
-                }
-                return
+        # 检查Skyfield是否可用
+        if not SKYFIELD_AVAILABLE:
+            # 如果Skyfield不可用，尝试重新初始化
+            print("Skyfield不可用，尝试重新初始化...")
+            self.init_skyfield_async()
+            # 等待一段时间让初始化完成
+            time.sleep(2)
         
-        if SKYFIELD_AVAILABLE:
-            self.calculate_moon_events_with_skyfield()
-        else:
-            # Skyfield不可用，设置错误信息
+        # 再次检查Skyfield是否可用
+        if not SKYFIELD_AVAILABLE:
+            print("Skyfield仍然不可用，无法计算月出月落")
             self.moon_events = {
                 "moonrise": "--:--",
                 "moonset": "--:--",
                 "first_event": "月出",
-                "first_time": "需要安装skyfield库",
+                "first_time": "Skyfield不可用",
                 "second_event": "月落",
-                "second_time": "需要安装skyfield库",
+                "second_time": "Skyfield不可用",
                 "moonrise_dt": None,
                 "moonset_dt": None
             }
+            return
+        
+        # 验证星历数据
+        if not self.verify_and_reload_ephemeris():
+            print("星历数据不可用，无法计算月出月落")
+            self.moon_events = {
+                "moonrise": "--:--",
+                "moonset": "--:--",
+                "first_event": "月出",
+                "first_time": "星历数据不可用",
+                "second_event": "月落",
+                "second_time": "星历数据不可用",
+                "moonrise_dt": None,
+                "moonset_dt": None
+            }
+            return
+        
+        # 使用Skyfield计算月出月落
+        self.calculate_moon_events_with_skyfield()
     
     def update_moon_events_periodically(self):
-        """每1分钟或位置变化时更新月出月落时间"""
+        """每1分钟或位置变化时更新月出月落时间，每1小时更新月食信息"""
         current_time = time.time()
         # 检查是否需要更新月出月落时间（1分钟或位置变化）
         if (current_time - self.last_moon_events_update >= 60 or  # 1分钟 = 60秒
             (self.location["latitude"] != self.last_location["latitude"] or 
-             self.location["longitude"] != self.last_location["longitude"] or
-             self.location["timezone"] != self.last_location["timezone"])):  # 位置发生变化
+            self.location["longitude"] != self.last_location["longitude"] or
+            self.location["timezone"] != self.last_location["timezone"])):  # 位置发生变化
             
             print("更新月出月落时间...")
             self.calculate_moon_events()
             self.last_moon_events_update = current_time
             self.last_location = self.location.copy()  # 更新上次位置信息
         
-        if current_time - self.last_eclipse_update >= 21600:  # 6小时 = 21600秒
-            print("更新日月食信息...")
+        # 修改这里：将6小时(21600秒)改为1小时(3600秒)
+        if current_time - self.last_eclipse_update >= 3600:  # 1小时 = 3600秒
+            print("更新月食信息...")
             self.calculate_eclipses()
             self.last_eclipse_update = current_time
     
@@ -998,7 +1078,7 @@ class MoonWidget:
                 .topmost-btn.pinned {
                     color: gold;
                 }
-                #loading {
+                .loading {
                     text-align: center;
                     margin: 20px 0;
                     font-size: 12px;
@@ -1139,9 +1219,9 @@ class MoonWidget:
             
             <div class="last-update" id="last-update">最后更新: --</div>
 
-            <!-- 暂时不显示有关日食月食的标题和内容 -->
+            <!-- 月食信息区域 -->
             <div class="eclipse-section">
-                <div class="eclipse-header"> </div>
+                <div class="eclipse-header">未来7天月食</div>
                 <div id="eclipse-list">
                     <div class="no-eclipse">加载中...</div>
                 </div>
@@ -1152,21 +1232,15 @@ class MoonWidget:
                     const eclipseList = document.getElementById('eclipse-list');
                     
                     if (eclipses.length === 0) {
-                        eclipseList.innerHTML = '<div class="no-eclipse"> </div>';
+                        eclipseList.innerHTML = '<div class="no-eclipse">未来7天内无月食</div>';
                         return;
                     }
                     
                     let html = '';
                     eclipses.forEach(eclipse => {
-                        // 根据类型设置不同的图标
-                        let icon = '🌙'; // 默认月亮
-                        if (eclipse.raw_type < 3) { // 日食
-                            icon = '☀️';
-                        }
-                        
                         html += `
                             <div class="eclipse-item">
-                                <span class="eclipse-time">${icon} ${eclipse.time}</span>
+                                <span class="eclipse-time">🌙 ${eclipse.time}</span>
                                 <span class="eclipse-type">${eclipse.type}</span>
                             </div>
                         `;
@@ -1232,7 +1306,7 @@ class MoonWidget:
                     
                     document.getElementById('moon-phase').textContent = moonEmoji;
                     
-                    // 更新日月食信息
+                    // 更新月食信息
                     updateEclipseData(data.eclipses || []);
 
                     // 更新最后更新时间
@@ -1294,7 +1368,8 @@ class MoonWidget:
                     second_time: "--",
                     visibility: "--",
                     phase: 0,
-                    skyfield_available: true
+                    skyfield_available: true,
+                    eclipses: []
                 });
             </script>
         </body>
@@ -1349,7 +1424,7 @@ class MoonWidget:
                     # 设置窗口样式为工具窗口，不显示在任务栏
                     win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, 
                                         win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) | win32con.WS_EX_TOOLWINDOW)
-                    print("任务栏图标已隐藏")
+                    print("任务栏图标隐藏")
                     return True  # 成功隐藏，退出循环
                     
             except Exception as e:
@@ -1368,7 +1443,7 @@ class MoonWidget:
         update_thread.daemon = True
         update_thread.start()
         
-        # 启动网络状态监控极线程
+        # 启动网络状态监控线程
         network_thread = threading.Thread(target=self.update_network_status)
         network_thread.daemon = True
         network_thread.start()
