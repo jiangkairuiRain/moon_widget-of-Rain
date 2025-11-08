@@ -20,6 +20,8 @@ sun = None
 moon = None
 earth = None
 HIDE_CONSOLE = False  # 新增：控制是否隐藏控制台窗口的全局变量
+de_bsp='de440s.bsp'
+
 
 def hide_console_window():
     """隐藏控制台窗口"""
@@ -60,10 +62,10 @@ class MoonWidget:
         # 初始化Skyfield
         self.init_skyfield_async()
 
-        self.eclipse_events = []  # 存储日月食事件
+        self.eclipse_events = []  # 存储月食事件
         self.last_eclipse_update = 0  # 上次日月食更新时间
         
-        # 添加日月食类型映射
+        # 添加日月食类型映射（仅月食）
         self.eclipse_types = {
             3: "月偏食",
             4: "月全食"
@@ -72,21 +74,21 @@ class MoonWidget:
         # 添加Skyfield初始化状态
         self.skyfield_error = None
         
+    # 在 calculate_lunar_eclipses 方法中添加可见性计算
     def calculate_lunar_eclipses(self, start_time, end_time):
         """计算月食事件"""
         try:
             from skyfield import eclipselib
-            
-            # 计算月食
+
             t, y, details = eclipselib.lunar_eclipses(start_time, end_time, eph)
-            
+
             eclipses = []
             for ti, yi in zip(t, y):
-                # 转换时间为本地时区
-                eclipse_time_utc = ti.utc_datetime()
-                eclipse_time_local = eclipse_time_utc.replace(tzinfo=timezone.utc).astimezone(self.local_tz)
-                
-                # 获取月食类型
+                # 确保带时区的 UTC datetime
+                eclipse_time_utc = ti.utc_datetime().replace(tzinfo=timezone.utc)
+
+                visible = self.is_moon_visible_at_time(eclipse_time_utc)
+
                 if yi == 0:
                     eclipse_type = "半影月食"
                 elif yi == 1:
@@ -95,21 +97,24 @@ class MoonWidget:
                     eclipse_type = "月全食"
                 else:
                     eclipse_type = f"未知月食({yi})"
-                
-                # 格式化事件信息
+
+                # 规范：time_utc 明确用 Z 表示 UTC；time 为 UTC 可读字符串；time_local 为观察点当地时区的用于显示的字符串
+                local_dt = eclipse_time_utc.astimezone(self.local_tz)
                 eclipse_info = {
-                    "time": eclipse_time_local.strftime("%m月%d日 %H:%M"),
+                    "time": eclipse_time_utc.strftime("%Y-%m-%d %H:%M:%S"),  # UTC 字符串
                     "type": eclipse_type,
-                    "raw_type": int(yi) + 3,  # 月食类型从3开始
-                    "time_utc": eclipse_time_utc.isoformat(),  # 转换为字符串
-                    "is_lunar": True
+                    "raw_type": int(yi) + 3,
+                    "time_utc": eclipse_time_utc.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
+                    "time_local": local_dt.strftime("%Y年%m月%d日 %H:%M"),  # 直接返回可供前端显示的本地化字符串
+                    "is_lunar": True,
+                    "visible": "可见" if visible else "不可见"
                 }
-                
+
                 eclipses.append(eclipse_info)
-                print(f"月食事件: {eclipse_info['time']} - {eclipse_info['type']}")
-            
+                print(f"月食事件: {eclipse_info['time_utc']} - {eclipse_info['type']} - 可见: {visible}")
+
             return eclipses
-            
+
         except Exception as e:
             print(f"计算月食事件错误: {e}")
             import traceback
@@ -117,38 +122,119 @@ class MoonWidget:
             return []
         
     def calculate_eclipses(self):
-        """计算未来7天内的月食事件"""
+        """计算未来10次的月食事件（按需扩展时间范围），并避免重复显示同一次月食。
+        将发生时间在14天以内的月食视为同一次月食，合并为单条记录。
+        """
         try:
             global SKYFIELD_AVAILABLE, ts, eph
-            
+
             if not SKYFIELD_AVAILABLE:
                 print("Skyfield不可用，无法计算月食")
                 self.eclipse_events = []
                 return
-                
-            # 检查星历数据是否可用
+
             if not self.verify_and_reload_ephemeris():
                 print("星历数据不可用，无法计算月食")
                 self.eclipse_events = []
                 return
-                
-            # 获取当前时间（UTC）
+
             now_utc = datetime.now(timezone.utc)
-            start_time = ts.utc(now_utc)
-            end_time = ts.utc(now_utc + timedelta(days=7))  # 未来7天
-            
-            print(f"查找月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()}")
-            
-            # 计算月食
-            lunar_eclipses = self.calculate_lunar_eclipses(start_time, end_time)
-            
-            # 限制显示数量，最多显示5个
-            lunar_eclipses = lunar_eclipses[:5]
-            
-            print(f"找到 {len(lunar_eclipses)} 个月食事件")
-            
-            self.eclipse_events = lunar_eclipses
-            
+
+            # 逐步扩大搜索窗口直到找到至少10次月食或达到最大年份限制
+            eclipses = []
+            searched_days = 365        # 初始搜索1年
+            max_days = 365 * 50       # 最多搜索50年
+
+            # 使用已存在事件的秒级时间戳列表，用于判断是否在14天内重复
+            existing_ts = []
+
+            def parse_to_utc(dt_str, fallback_str=None):
+                try:
+                    if not dt_str:
+                        return None
+                    # 如果带 Z，先替换为 +00:00 再解析，保证得到 timezone-aware
+                    if dt_str.endswith('Z'):
+                        return datetime.fromisoformat(dt_str.replace('Z', '+00:00')).astimezone(timezone.utc)
+                    # 如果带偏移（+/-），fromisoformat 会返回带 tzinfo 的 datetime
+                    dt = datetime.fromisoformat(dt_str)
+                    if dt.tzinfo is None:
+                        # 明确当作 UTC
+                        return dt.replace(tzinfo=timezone.utc)
+                    return dt.astimezone(timezone.utc)
+                except Exception:
+                    if fallback_str:
+                        try:
+                            return datetime.strptime(fallback_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        except Exception:
+                            return None
+                    return None
+
+            def is_within_days(timestamp, existing_list, days=14):
+                """判断 timestamp（秒）是否与 existing_list 中任一时间在 days 天内"""
+                limit = days * 86400
+                for t in existing_list:
+                    if abs(timestamp - t) <= limit:
+                        return True
+                return False
+
+            while len(eclipses) < 10 and searched_days <= max_days:
+                start_time = ts.utc(now_utc)
+                end_time = ts.utc(now_utc + timedelta(days=searched_days))
+                print(f"查找月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()} (搜索天数={searched_days})")
+
+                found = self.calculate_lunar_eclipses(start_time, end_time)
+                # 遍历并按时间合并/去重加入eclipses
+                for e in found:
+                    # 解析时间为UTC datetime
+                    e_time = None
+                    if "time_utc" in e and e["time_utc"]:
+                        e_time = parse_to_utc(e["time_utc"], e.get("time"))
+                    else:
+                        e_time = parse_to_utc(e.get("time", ""), e.get("time"))
+
+                    if e_time is None:
+                        continue
+
+                    # 只保留未来（>= now_utc）的事件
+                    if e_time < now_utc:
+                        continue
+
+                    # 使用秒级时间戳作为比较基准
+                    key = int(e_time.replace(tzinfo=timezone.utc).timestamp())
+
+                    # 如果已有事件在14天内，认为是同一次月食，跳过（保留首次加入的）
+                    if is_within_days(key, existing_ts, days=14):
+                        # 跳过重复事件
+                        continue
+
+                    # 规范化存储的 time_utc 使用 ISO 格式（无微秒，带 Z）
+                    e["time_utc"] = e_time.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+                    # 也统一 time 字段为 "YYYY-MM-DD HH:MM:SS" 格式（UTC）
+                    e["time"] = e_time.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                    # 增加观察点本地化显示字符串（直接给前端用，避免前端按机器时区转换）
+                    try:
+                        e_local = e_time.astimezone(self.local_tz)
+                        e["time_local"] = e_local.strftime("%Y年%m月%d日 %H:%M")
+                    except Exception:
+                        e["time_local"] = e["time"]  # 兜底：显示UTC格式
+
+                    eclipses.append(e)
+                    existing_ts.append(key)
+
+                # 如果不足，扩大搜索窗口（指数增长）
+                if len(eclipses) < 10:
+                    searched_days *= 2
+
+            # 按UTC时间排序并取前10条
+            try:
+                eclipses.sort(key=lambda x: int(datetime.fromisoformat(x["time_utc"].replace('Z', '+00:00')).timestamp()))
+            except Exception:
+                eclipses.sort(key=lambda x: x.get("time", ""))
+
+            self.eclipse_events = eclipses[:10]
+
+            print(f"找到 {len(self.eclipse_events)} 个月食事件（取前10条，14天内视为同次）")
+
         except Exception as e:
             print(f"计算月食事件错误: {e}")
             import traceback
@@ -240,7 +326,7 @@ class MoonWidget:
                 from skyfield import almanac
                 
                 # 指定本地星历表文件路径
-                de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
+                de421_path = os.path.join(os.path.dirname(__file__), de_bsp)
                 
                 # 检查网络状态，如果网络不可用，只尝试从本地加载
                 if not self.network_available:
@@ -265,7 +351,7 @@ class MoonWidget:
                 else:
                     print("从网络加载星历数据，请耐心等待...")
                     ts = load.timescale()
-                    eph = load('de421.bsp')
+                    eph = load(de_bsp)
                 
                 sun, moon, earth = eph['sun'], eph['moon'], eph['earth']
                 SKYFIELD_AVAILABLE = True
@@ -321,7 +407,7 @@ class MoonWidget:
             
             try:
                 # 尝试重新加载星历数据
-                de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
+                de421_path = os.path.join(os.path.dirname(__file__), de_bsp)
                 if os.path.exists(de421_path):
                     # 从本地加载
                     from skyfield.api import load
@@ -331,7 +417,7 @@ class MoonWidget:
                     # 只有网络可用时才尝试从网络下载
                     from skyfield.api import load
                     ts = load.timescale()
-                    eph = load('de421.bsp')
+                    eph = load(de_bsp)
                 else:
                     # 网络不可用且本地无星历数据文件
                     print("无法加载星历数据: 网络不可用且本地无星历数据文件")
@@ -369,7 +455,7 @@ class MoonWidget:
             if was_online:
                 print("网络断开，尝试使用本地星历数据...")
                 # 检查本地是否有星历数据文件
-                de421_path = os.path.join(os.path.dirname(__file__), 'de421.bsp')
+                de421_path = os.path.join(os.path.dirname(__file__), de_bsp)
                 if os.path.exists(de421_path):
                     print("找到本地星历数据文件，尝试加载...")
                     self.init_skyfield_async()
@@ -502,9 +588,9 @@ class MoonWidget:
                 }
     
     def update_location_periodically(self):
-        """每10秒更新一次位置信息，如果位置变化则标记需要更新月出月落时间"""
+        """每10秒更新一次位置信息，如果位置变化则更新可见性并立即重新计算月出月落"""
         current_time = time.time()
-        if current_time - self.last_ip_update >= 10:  # 10秒更新一次
+        if current_time - self.last_ip_update >= 10:
             print("更新位置信息...")
             new_location = self.get_location()
             if new_location:
@@ -517,13 +603,24 @@ class MoonWidget:
                 
                 if location_changed:
                     print(f"位置已更新: {new_location['name']}")
+                    # 先更新位置与时区
                     self.location = new_location
                     self.local_tz = pytz.timezone(self.location["timezone"])
-                    # 位置变化时需要重新计算月出月落
-                    self.last_moon_events_update = 0  # 强制下次更新月出月落
-                    # 位置变化时也需要更新月食信息
-                    self.last_eclipse_update = 0  # 新增：强制下次更新月食信息
-                    self.last_location = self.location.copy()  # 更新上次位置信息
+
+                    # 立即重新计算月出/月落（确保界面显示本地时间与新的月出月落）
+                    try:
+                        print("位置变化，重新计算月出月落时间...")
+                        self.calculate_moon_events()
+                        # 更新月食可见性
+                        self.update_eclipse_visibility_only()
+                        # 标记最近更新时间，避免其他周期重复触发过于频繁的计算
+                        self.last_moon_events_update = current_time
+                    except Exception as e:
+                        print(f"位置变化时重新计算月出月落失败: {e}")
+
+                    # 更新保存的上次位置用于后续比较
+                    self.last_location = self.location.copy()
+
             self.last_ip_update = current_time
     
     def calculate_moon_events_with_skyfield(self):
@@ -752,7 +849,72 @@ class MoonWidget:
             print("更新月食信息...")
             self.calculate_eclipses()
             self.last_eclipse_update = current_time
-    
+
+    def update_eclipse_visibility_only(self):
+        """只更新当前月食事件的可见性和本地显示时间，不修改UTC时间数据"""
+        for event in self.eclipse_events:
+            try:
+                # 解析为带时区的 UTC datetime
+                if "time_utc" in event and event["time_utc"]:
+                    t = event["time_utc"]
+                    if t.endswith('Z'):
+                        eclipse_time_utc = datetime.fromisoformat(t.replace('Z', '+00:00'))
+                    else:
+                        dt = datetime.fromisoformat(t)
+                        if dt.tzinfo is None:
+                            eclipse_time_utc = dt.replace(tzinfo=timezone.utc)
+                        else:
+                            eclipse_time_utc = dt.astimezone(timezone.utc)
+                else:
+                    eclipse_time_utc = datetime.strptime(event.get("time", ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+                # 更新可见性（使用 UTC datetime）
+                event["visible"] = "可见" if self.is_moon_visible_at_time(eclipse_time_utc) else "不可见"
+
+                # 同步更新用于前端显示的本地化字符串（使用当前 self.local_tz）
+                try:
+                    local_dt = eclipse_time_utc.astimezone(self.local_tz)
+                    event["time_local"] = local_dt.strftime("%Y年%m月%d日 %H:%M")
+                except Exception:
+                    # 兜底：保留原有 time_local 或 UTC 格式 time
+                    event["time_local"] = event.get("time_local", event.get("time", ""))
+
+            except Exception as e:
+                print(f"更新可见性/本地时间错误: {e}")
+                event["visible"] = "未知"
+                # 尽量保留已有本地显示字段
+                if "time_local" not in event:
+                    event["time_local"] = event.get("time", "")
+
+    def update_eclipse_events_periodically(self):
+        """每2分钟更新月食事件（获取未来10次，并更新可见性）"""
+        while self.is_running:
+            try:
+                # 计算并获取未来10次月食
+                if SKYFIELD_AVAILABLE:
+                    self.calculate_eclipses()
+                    # 更新每个事件的可见性
+                    for event in self.eclipse_events:
+                        try:
+                            if "time_utc" in event:
+                                eclipse_time_utc = datetime.fromisoformat(event["time_utc"].replace('Z', '+00:00'))
+                            else:
+                                eclipse_time_utc = datetime.strptime(event["time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                            visible = self.is_moon_visible_at_time(eclipse_time_utc)
+                            event["visible"] = "可见" if visible else "不可见"
+                        except Exception as e:
+                            print(f"更新单个月食可见性错误: {e}")
+                            event["visible"] = "未知"
+                else:
+                    self.eclipse_events = []
+
+                print(f"已更新月食事件，共 {len(self.eclipse_events)} 条（未来10次）")
+            except Exception as e:
+                print(f"更新月食事件错误: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(120)
+            
     def get_azimuth_direction(self, azimuth):
         """将方位角转换为方向（东、南、西、北等）"""
         directions = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
@@ -777,6 +939,36 @@ class MoonWidget:
         except:
             return "未知"
     
+    def is_moon_visible_at_time(self, time_utc):
+        """检查在特定时间月球是否可见（在地平线以上）"""
+        try:
+            global SKYFIELD_AVAILABLE, ts, eph, moon, earth
+            
+            if not SKYFIELD_AVAILABLE:
+                return False
+                
+            # 检查星历数据是否可用
+            if not self.verify_and_reload_ephemeris():
+                return False
+                
+            # 创建观察者位置
+            from skyfield.api import wgs84
+            observer = wgs84.latlon(self.location["latitude"], self.location["longitude"])
+            
+            # 计算月球位置
+            t = ts.utc(time_utc)
+            apparent = (earth + observer).at(t).observe(moon).apparent()
+            
+            # 获取高度角
+            alt, az, _ = apparent.altaz()
+            
+            # 高度角大于0表示可见
+            return alt.degrees > 0
+            
+        except Exception as e:
+            print(f"计算月球可见性错误: {e}")
+            return False
+
     def update_network_status(self):
         """定期更新网络状态并通知界面"""
         while self.is_running:
@@ -890,12 +1082,12 @@ class MoonWidget:
                 "location": self.location["name"],
                 "longitude": f"{abs(self.location['longitude']):.4f}°{'E' if self.location['longitude'] >= 0 else 'W'}",  # 经度显示，正数为东经(E)，负数为西经(W)
                 "latitude": f"{abs(self.location['latitude']):.4f}°{'N' if self.location['latitude'] >= 0 else 'S'}",    # 纬度显示，正数为北纬(N)，负数为南纬(S)
-                "moonrise": self.moon_events["moonrise"],
-                "moonset": self.moon_events["moonset"],
-                "first_event": self.moon_events["first_event"],
-                "first_time": self.moon_events["first_time"],
-                "second_event": self.moon_events["second_event"],
-                "second_time": self.moon_events["second_time"],
+                "moonrise": self.moon_events.get("moonrise", "--:--"),
+                "moonset": self.moon_events.get("moonset", "--:--"),
+                "first_event": self.moon_events.get("first_event", "月出"),
+                "first_time": self.moon_events.get("first_time", "--"),
+                "second_event": self.moon_events.get("second_event", "月落"),
+                "second_time": self.moon_events.get("second_time", "--"),
                 "visibility": visibility,
                 "online": self.network_available,
                 "timezone": self.location["timezone"],
@@ -958,18 +1150,18 @@ class MoonWidget:
                 
                 # 窗口尺寸和位置 - 增加高度以确保内容完全显示
                 window_width = 300
-                window_height = 750  # 增加高度以适应内容
+                window_height = 950  # 增加高度以适应内容
                 x = screen_width - window_width - 20  # 右侧留20像素边距
                 y = 100  # 离顶部100像素
             except:
                 # 如果无法获取屏幕尺寸，使用默认值
                 x, y = 100, 100
-                window_width, window_height = 300, 750  # 增加高度以适应内容
+                window_width, window_height = 300, 950  # 增加高度以适应内容
         except Exception as e:
             print(f"窗口创建错误: {e}")
             # 使用安全的默认值
             x, y = 100, 100
-            window_width, window_height = 300, 750  # 增加高度以适应内容
+            window_width, window_height = 300, 950  # 增加高度以适应内容
     
         
         # HTML内容
@@ -990,7 +1182,7 @@ class MoonWidget:
                     -webkit-backdrop-filter: blur(5px);
                     overflow: hidden;
                     border: 1px solid rgba(255, 255, 255, 0.1);
-                    height: 750px; /* 增加高度以适应内容 */
+                    height: 950px; /* 增加高度以适应内容 */
                     box-sizing: border-box;
                 }
                 .header {
@@ -1101,8 +1293,8 @@ class MoonWidget:
                     padding: 15px 0;
                     border-top: 1px solid rgba(255, 255, 255, 0.1);
                     border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-                    max-height: 120px; /* 限制高度 */
-                    overflow-y: auto;  /* 添加滚动条 */
+                    height: auto; /* 自动高度，完整显示内容 */
+                    overflow-y: visible; /* 不显示滚动条 */
                 }
                 .eclipse-header {
                     text-align: center;
@@ -1221,34 +1413,13 @@ class MoonWidget:
 
             <!-- 月食信息区域 -->
             <div class="eclipse-section">
-                <div class="eclipse-header">未来7天月食</div>
+                <div class="eclipse-header">未来月食</div>
                 <div id="eclipse-list">
                     <div class="no-eclipse">加载中...</div>
                 </div>
             </div>
 
             <script>
-                function updateEclipseData(eclipses) {
-                    const eclipseList = document.getElementById('eclipse-list');
-                    
-                    if (eclipses.length === 0) {
-                        eclipseList.innerHTML = '<div class="no-eclipse">未来7天内无月食</div>';
-                        return;
-                    }
-                    
-                    let html = '';
-                    eclipses.forEach(eclipse => {
-                        html += `
-                            <div class="eclipse-item">
-                                <span class="eclipse-time">🌙 ${eclipse.time}</span>
-                                <span class="eclipse-type">${eclipse.type}</span>
-                            </div>
-                        `;
-                    });
-                    
-                    eclipseList.innerHTML = html;
-                }
-
                 function updateMoonData(data) {
                     // 隐藏加载提示
                     document.getElementById('loading').style.display = 'none';
@@ -1348,7 +1519,50 @@ class MoonWidget:
                     document.getElementById('loading').style.display = 'none';
                 }
                 
-                
+
+                function updateEclipseData(eclipses) {
+                    const eclipseList = document.getElementById('eclipse-list');
+                    if (eclipses.length === 0) {
+                        eclipseList.innerHTML = '<div class="no-eclipse">未来暂无月食信息</div>';
+                        return;
+                    }
+                    
+                    let html = '';
+                    eclipses.forEach(eclipse => {
+                        const icon = '🌙';
+                        let mainColor = eclipse.visible === '可见' ? '#7fff7f' : '#ff7f7f';
+                        let visibilityText = `<span style="color:${mainColor}">（${eclipse.visible}）</span>`;
+
+                        // 优先使用后端提供的本地化显示字符串 time_local（已经是观测地时区格式）
+                        let localTimeStr = eclipse.time_local || eclipse.time;
+                        // 兼容旧版格式：若没有 time_local，则把 UTC time 转为本机本地时间（保底）
+                        if (!eclipse.time_local && eclipse.time) {
+                            try {
+                                let utcStr = eclipse.time.replace(' ', 'T') + 'Z';
+                                let dateObj = new Date(utcStr);
+                                if (!isNaN(dateObj.getTime())) {
+                                    localTimeStr = dateObj.getFullYear() + '年'
+                                        + String(dateObj.getMonth() + 1).padStart(2, '0') + '月'
+                                        + String(dateObj.getDate()).padStart(2, '0') + '日 '
+                                        + String(dateObj.getHours()).padStart(2, '0') + ':'
+                                        + String(dateObj.getMinutes()).padStart(2, '0');
+                                }
+                            } catch (e) {
+                                console.log('时间转换失败，使用原始时间:', e);
+                            }
+                        }
+
+                        html += `
+                            <div class="eclipse-item">
+                                <span class="eclipse-time">${icon} ${localTimeStr}</span>
+                                <span class="eclipse-type" style="color:${mainColor}">${eclipse.type}${visibilityText}</span>
+                            </div>
+                        `;
+                    });
+                    
+                    eclipseList.innerHTML = html;
+                }
+
 
                 // 初始显示
                 updateMoonData({
@@ -1371,6 +1585,8 @@ class MoonWidget:
                     skyfield_available: true,
                     eclipses: []
                 });
+
+
             </script>
         </body>
         </html>
@@ -1452,6 +1668,11 @@ class MoonWidget:
         hide_icon_thread = threading.Thread(target=self.hide_taskbar_icon)
         hide_icon_thread.daemon = True
         hide_icon_thread.start()
+        
+        # 启动月食事件更新线程
+        eclipse_thread = threading.Thread(target=self.update_eclipse_events_periodically)
+        eclipse_thread.daemon = True
+        eclipse_thread.start()
         
         # 启动WebView
         webview.start(debug=False)
