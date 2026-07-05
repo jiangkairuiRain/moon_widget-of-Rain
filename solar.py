@@ -15,6 +15,26 @@ from skyfield.positionlib import ICRF
 from skyfield.units import Angle
 import numpy as np
 
+# ===== Skyfield timescale now() wrapper =====
+_ts_now_override = None
+
+def set_ts_now_override(jd):
+    """设置timescale.now()的覆盖值（通常是一个 skyfield Time 对象）。"""
+    global _ts_now_override
+    _ts_now_override = jd
+
+def clear_ts_now_override():
+    """清除覆盖，使 get_ts_now() 返回真实的 ts.now()。"""
+    global _ts_now_override
+    _ts_now_override = None
+
+def get_ts_now():
+    """获取当前时间的 skyfield Time 对象，支持覆盖以便调试。"""
+    if _ts_now_override is not None:
+        return _ts_now_override
+    return ts.now()
+
+
 planets = load('de440s.bsp')
 ts = load.timescale()
 
@@ -398,9 +418,9 @@ def calculate_future_eclipses(start_time=None, years=5):
             jd = ts.tt(year, month, day, 12, 0, 0)
         except ValueError:
             print("输入格式错误，使用当前时间")
-            jd = ts.now()
+            jd = get_ts_now()
     else:
-        jd = ts.now()
+        jd = get_ts_now()
     
     # 估算未来years年内的日食次数（每年约2-5次）
     num_eclipses = years * 3  # 保守估计

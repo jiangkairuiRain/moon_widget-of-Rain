@@ -12,6 +12,46 @@ import requests
 import geoip2.database
 from urllib.request import urlopen
 
+# ===== 时间获取封装 =====
+# 通过包装获取当前时间的函数，可以在调试或测试时覆盖返回值，
+# 以便于模拟不同时间下程序的表现。
+_current_time_override = None
+
+def set_current_time_override(dt):
+    """设置覆盖值，传入带时区的 datetime 对象。"""
+    global _current_time_override
+    _current_time_override = dt
+
+def clear_current_time_override():
+    """清除覆盖，使获取时间恢复为真实当前时间。"""
+    global _current_time_override
+    _current_time_override = None
+
+def get_current_time():
+    """获取当前 UTC 时刻（带时区）。如果设置了覆盖值，则返回覆盖值。"""
+    if _current_time_override is not None:
+        print(f"[DEBUG] get_current_time override: {_current_time_override.isoformat()}")
+        return _current_time_override
+    now = datetime.now(timezone.utc)
+    print(f"[DEBUG] get_current_time real: {now.isoformat()}")
+    return now
+
+def get_current_timestamp():
+    """返回当前时间戳（秒）。"""
+    return get_current_time().timestamp()
+
+def get_local_time(tz):
+    """返回指定时区的当前时间。"""
+    return get_current_time().astimezone(tz)
+
+
+# t = datetime(2026,3,3,19,50,tzinfo=pytz.timezone('Asia/Shanghai'))
+# set_current_time_override(t.astimezone(timezone.utc))
+
+
+
+
+
 # 全局变量
 SKYFIELD_AVAILABLE = False
 ts = None
@@ -39,6 +79,11 @@ def hide_console_window():
 
 class MoonWidget:
     def __init__(self):
+        self.ts = None
+        self.earth = None
+        self.sun = None
+        self.moon = None
+
         self.window = None
         self.update_interval = 1  # 更新间隔改为1秒
         self.is_running = True
@@ -74,57 +119,160 @@ class MoonWidget:
         # 添加Skyfield初始化状态
         self.skyfield_error = None
         
+    def get_current_eclipse(self):
+            """返回当前正在发生的月食事件（如果有），否则返回 None"""
+            now_utc = get_current_time()
+            print(f"get_current_eclipse: now_utc = {now_utc.isoformat()}")
+            print(f"当前事件列表共有 {len(self.eclipse_events)} 条：")
+            for i, event in enumerate(self.eclipse_events):
+                print(f"事件 {i}: type={event.get('type')}, time_utc={event.get('time_utc')}")
+                if 'start_utc' in event and event['start_utc'] and 'end_utc' in event and event['end_utc']:
+                    try:
+                        start = datetime.fromisoformat(event['start_utc'].replace('Z', '+00:00'))
+                        end   = datetime.fromisoformat(event['end_utc'].replace('Z', '+00:00'))
+                        print(f"   start_utc={start.isoformat()}, end_utc={end.isoformat()}")
+                        if start <= now_utc <= end:
+                            print("   ✅ 当前时间在此事件内，返回该事件")
+                            return event
+                        else:
+                            print("   ❌ 当前时间不在该事件区间内")
+                    except Exception as e:
+                        print(f"   解析异常: {e}")
+                else:
+                    print("   缺少 start_utc 或 end_utc，跳过")
+            print("未找到当前月食")
+            return None
+    
     # 在 calculate_lunar_eclipses 方法中添加可见性计算
     def calculate_lunar_eclipses(self, start_time, end_time):
-        """计算月食事件"""
-        try:
-            from skyfield import eclipselib
+        """使用向量几何法计算月食阶段"""
+        from skyfield.api import load
+        import numpy as np
 
-            t, y, details = eclipselib.lunar_eclipses(start_time, end_time, eph)
+        Rm = 1737.4  # 月球半径
 
-            eclipses = []
-            for ti, yi in zip(t, y):
-                # 确保带时区的 UTC datetime
-                eclipse_time_utc = ti.utc_datetime().replace(tzinfo=timezone.utc)
+        # 定义阈值函数
+        def penumbra_thresh(ru, rp):
+            return rp + Rm
 
-                visible = self.is_moon_visible_at_time(eclipse_time_utc)
+        def umbra_outer_thresh(ru, rp):
+            return ru + Rm
 
-                if yi == 0:
-                    eclipse_type = "半影月食"
-                elif yi == 1:
-                    eclipse_type = "月偏食"
-                elif yi == 2:
-                    eclipse_type = "月全食"
-                else:
-                    eclipse_type = f"未知月食({yi})"
+        def umbra_inner_thresh(ru, rp): 
+            return ru - Rm   # 关键修改
+        # 搜索各阶段
+        p_times, _ = self._find_crossings(start_time, end_time, penumbra_thresh)
+        uo_times, _ = self._find_crossings(start_time, end_time, umbra_outer_thresh)
+        ui_times, _ = self._find_crossings(start_time, end_time, umbra_inner_thresh)
+        print(f"半影交叉点数量: {len(p_times)}")
+        print(f"本影外缘交叉点数量: {len(uo_times)}")
+        print(f"本影内缘交叉点数量: {len(ui_times)}")
+        # 收集所有时间点并排序
+        all_times = []
+        all_times.extend([(t, 'penumbral') for t in p_times])
+        all_times.extend([(t, 'umbral_outer') for t in uo_times])
+        all_times.extend([(t, 'umbral_inner') for t in ui_times])
+        all_times.sort(key=lambda x: x[0].utc_datetime())
 
-                # 规范：time_utc 明确用 Z 表示 UTC；time 为 UTC 可读字符串；time_local 为观察点当地时区的用于显示的字符串
-                local_dt = eclipse_time_utc.astimezone(self.local_tz)
-                eclipse_info = {
-                    "time": eclipse_time_utc.strftime("%Y-%m-%d %H:%M:%S"),  # UTC 字符串
-                    "type": eclipse_type,
-                    "raw_type": int(yi) + 3,
-                    "time_utc": eclipse_time_utc.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
-                    "time_local": local_dt.strftime("%Y年%m月%d日 %H:%M"),  # 直接返回可供前端显示的本地化字符串
-                    "is_lunar": True,
-                    "visible": "可见" if visible else "不可见"
-                }
+        if len(all_times) < 2:
+            return []  # 无月食
+        
+        # 按逻辑顺序分配阶段名称
+        stages = {}
+        # 半影始终取第一个和最后一个 penumbral
+        pen_times = [t for t, typ in all_times if typ == 'penumbral']
+        if pen_times:
+            stages['penumbral_start'] = pen_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+            stages['penumbral_end'] = pen_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
 
-                eclipses.append(eclipse_info)
-                print(f"月食事件: {eclipse_info['time_utc']} - {eclipse_info['type']} - 可见: {visible}")
+        # 本影外缘（初亏/复圆）
+        uo_times = [t for t, typ in all_times if typ == 'umbral_outer']
+        if uo_times:
+            stages['umbral_start'] = uo_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+            stages['umbral_end'] = uo_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
 
-            return eclipses
+        # 本影内缘（食既/生光）
+        ui_times = [t for t, typ in all_times if typ == 'umbral_inner']
+        if ui_times:
+            stages['total_start'] = ui_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+            stages['total_end'] = ui_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
 
-        except Exception as e:
-            print(f"计算月食事件错误: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+        # 食甚（距离最小）
+        if uo_times:
+            # 在初亏和复圆之间寻找距离最小点
+            t0_sec = uo_times[0].utc_datetime().timestamp()
+            t1_sec = uo_times[-1].utc_datetime().timestamp()
+            best_t = uo_times[0]
+            best_d = None
+            # 粗采样
+            n = 200
+            for i in range(n + 1):
+                sec = t0_sec + (t1_sec - t0_sec) * i / n
+                ti = self.ts.utc(datetime.fromtimestamp(sec, timezone.utc))
+                d, _, _ = self._shadow_geometry(ti)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best_t = ti
+            # 可选 scipy 优化
+            try:
+                import scipy.optimize as opt
+                def dfunc(sec):
+                    ti = self.ts.utc(datetime.fromtimestamp(sec, timezone.utc))
+                    return self._shadow_geometry(ti)[0]
+                res = opt.minimize_scalar(dfunc, bounds=(t0_sec, t1_sec), method='bounded')
+                if res.success:
+                    best_t = self.ts.utc(datetime.fromtimestamp(res.x, timezone.utc))
+            except ImportError:
+                pass
+            stages['maximum'] = best_t.utc_datetime().replace(tzinfo=timezone.utc)
+        else:
+            # 如果没有本影接触，则取 penumbral 之间的最小距离作为食甚
+            if pen_times:
+                # 类似方法
+                pass
+        
+        print("stages 字典内容:", stages)
+
+        # 确定月食类型
+        if 'total_start' in stages:
+            eclipse_type = "月全食"
+        elif 'umbral_start' in stages:
+            eclipse_type = "月偏食"
+        else:
+            eclipse_type = "半影月食"
+
+        # 构造前端兼容的事件字典
+        eclipse_time_utc = stages.get('maximum', stages.get('penumbral_start'))
+        visible = self.is_moon_visible_at_time(eclipse_time_utc)
+        local_dt = eclipse_time_utc.astimezone(self.local_tz)
+
+        # 将各阶段时间转为 ISO 字符串
+        stages_iso = {}
+        for key, dt in stages.items():
+            stages_iso[key] = dt.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+        eclipse_info = {
+            "time": eclipse_time_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": eclipse_type,
+            "time_utc": eclipse_time_utc.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
+            "time_local": local_dt.strftime("%Y年%m月%d日 %H:%M"),
+            "is_lunar": True,
+            "visible": "可见" if visible else "不可见",
+            "stages": stages_iso,
+            "start_utc": stages_iso.get('penumbral_start'),
+            "end_utc": stages_iso.get('penumbral_end')
+        }
+        print("eclipse_info 关键字段:", {
+            "time_utc": eclipse_info["time_utc"],
+            "start_utc": eclipse_info["start_utc"],
+            "end_utc": eclipse_info["end_utc"],
+            "stages_keys": list(eclipse_info["stages"].keys())
+        })
+
+        return [eclipse_info]  # 注意：此方法只返回当前区间内的一次月食，外层循环会多次调用以获取多次
         
     def calculate_eclipses(self):
-        """计算未来10次的月食事件（按需扩展时间范围），并避免重复显示同一次月食。
-        将发生时间在14天以内的月食视为同一次月食，合并为单条记录。
-        """
+        """计算未来10次的月食事件：先用eclipselib快速定位食甚，再用几何法计算详细阶段"""
         try:
             global SKYFIELD_AVAILABLE, ts, eph
 
@@ -138,39 +286,35 @@ class MoonWidget:
                 self.eclipse_events = []
                 return
 
-            now_utc = datetime.now(timezone.utc)
+            now_utc = get_current_time()
+            from skyfield import eclipselib
 
-            # 逐步扩大搜索窗口直到找到至少10次月食或达到最大年份限制
+            # 逐步扩大搜索窗口直到找到至少10次月食
             eclipses = []
-            searched_days = 365        # 初始搜索1年
-            max_days = 365 * 50       # 最多搜索50年
+            searched_days = 365
+            max_days = 365 * 10  # 最多搜索10年，避免无限循环
+            existing_ts = []  # 用于14天去重
 
-            # 使用已存在事件的秒级时间戳列表，用于判断是否在14天内重复
-            existing_ts = []
-
+            # 辅助函数：解析UTC字符串
             def parse_to_utc(dt_str, fallback_str=None):
                 try:
                     if not dt_str:
                         return None
-                    # 如果带 Z，先替换为 +00:00 再解析，保证得到 timezone-aware
                     if dt_str.endswith('Z'):
                         return datetime.fromisoformat(dt_str.replace('Z', '+00:00')).astimezone(timezone.utc)
-                    # 如果带偏移（+/-），fromisoformat 会返回带 tzinfo 的 datetime
                     dt = datetime.fromisoformat(dt_str)
                     if dt.tzinfo is None:
-                        # 明确当作 UTC
                         return dt.replace(tzinfo=timezone.utc)
                     return dt.astimezone(timezone.utc)
                 except Exception:
                     if fallback_str:
                         try:
                             return datetime.strptime(fallback_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                        except Exception:
-                            return None
+                        except:
+                            pass
                     return None
 
             def is_within_days(timestamp, existing_list, days=14):
-                """判断 timestamp（秒）是否与 existing_list 中任一时间在 days 天内"""
                 limit = days * 86400
                 for t in existing_list:
                     if abs(timestamp - t) <= limit:
@@ -178,68 +322,164 @@ class MoonWidget:
                 return False
 
             while len(eclipses) < 10 and searched_days <= max_days:
-                start_time = ts.utc(now_utc)
+                start_time = ts.utc(now_utc - timedelta(days=2))  # 向前推2天，覆盖可能正在进行的月食
                 end_time = ts.utc(now_utc + timedelta(days=searched_days))
-                print(f"查找月食事件的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()} (搜索天数={searched_days})")
+                print(f"查找月食食甚的时间范围: {start_time.utc_datetime()} 到 {end_time.utc_datetime()} (搜索天数={searched_days})")
 
-                found = self.calculate_lunar_eclipses(start_time, end_time)
-                # 遍历并按时间合并/去重加入eclipses
-                for e in found:
-                    # 解析时间为UTC datetime
-                    e_time = None
-                    if "time_utc" in e and e["time_utc"]:
-                        e_time = parse_to_utc(e["time_utc"], e.get("time"))
-                    else:
-                        e_time = parse_to_utc(e.get("time", ""), e.get("time"))
+                # 使用eclipselib获取食甚时间
+                t, y, details = eclipselib.lunar_eclipses(start_time, end_time, eph)
+                print(f"找到 {len(t)} 个食甚时刻")
 
-                    if e_time is None:
-                        continue
+                for ti, yi in zip(t, y):
+                    eclipse_time_utc = ti.utc_datetime().replace(tzinfo=timezone.utc)
 
-                    # 只保留未来（>= now_utc）的事件
-                    if e_time < now_utc:
-                        continue
-
-                    # 使用秒级时间戳作为比较基准
-                    key = int(e_time.replace(tzinfo=timezone.utc).timestamp())
-
-                    # 如果已有事件在14天内，认为是同一次月食，跳过（保留首次加入的）
+                    # 去重：14天内视为同一次
+                    key = int(eclipse_time_utc.timestamp())
                     if is_within_days(key, existing_ts, days=14):
-                        # 跳过重复事件
                         continue
 
-                    # 规范化存储的 time_utc 使用 ISO 格式（无微秒，带 Z）
-                    e["time_utc"] = e_time.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-                    # 也统一 time 字段为 "YYYY-MM-DD HH:MM:SS" 格式（UTC）
-                    e["time"] = e_time.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-                    # 增加观察点本地化显示字符串（直接给前端用，避免前端按机器时区转换）
-                    try:
-                        e_local = e_time.astimezone(self.local_tz)
-                        e["time_local"] = e_local.strftime("%Y年%m月%d日 %H:%M")
-                    except Exception:
-                        e["time_local"] = e["time"]  # 兜底：显示UTC格式
+                    # 调用几何法计算详细阶段（搜索窗口：食甚前后2天）
+                    start_search = eclipse_time_utc - timedelta(days=2)
+                    end_search = eclipse_time_utc + timedelta(days=2)
 
-                    eclipses.append(e)
-                    existing_ts.append(key)
+                    # 根据 yi 确定类型
+                    if yi == 2:
+                        eclipselib_type = "月全食"
+                    elif yi == 1:
+                        eclipselib_type = "月偏食"
+                    else:
+                        eclipselib_type = "半影月食"
 
-                # 如果不足，扩大搜索窗口（指数增长）
+                    event = self.calculate_lunar_eclipse_details(
+                        ts.utc(start_search),
+                        ts.utc(end_search),
+                        eclipse_time_utc,
+                        eclipselib_type   # 关键：传递类型
+                    )
+                    if event:
+                        # 解析 end_utc
+                        end_utc = parse_to_utc(event['end_utc'])
+                        # 如果事件已经完全结束，则跳过
+                        if end_utc and end_utc < now_utc:
+                            print(f"事件 {eclipse_time_utc} 已完全结束，跳过")
+                            continue
+                        eclipses.append(event)
+                        existing_ts.append(key)
+
+                # 如果不足，扩大搜索天数
                 if len(eclipses) < 10:
                     searched_days *= 2
 
-            # 按UTC时间排序并取前10条
-            try:
-                eclipses.sort(key=lambda x: int(datetime.fromisoformat(x["time_utc"].replace('Z', '+00:00')).timestamp()))
-            except Exception:
-                eclipses.sort(key=lambda x: x.get("time", ""))
-
+            # 按UTC时间排序
+            eclipses.sort(key=lambda x: x["time_utc"])
             self.eclipse_events = eclipses[:10]
-
-            print(f"找到 {len(self.eclipse_events)} 个月食事件（取前10条，14天内视为同次）")
+            print(f"最终得到 {len(self.eclipse_events)} 个月食事件")
 
         except Exception as e:
             print(f"计算月食事件错误: {e}")
             import traceback
             traceback.print_exc()
             self.eclipse_events = []
+
+        
+        
+    def calculate_lunar_eclipse_details(self, start_time, end_time, max_time_utc, eclipselib_type=None):
+        print(f"\n计算月食细节，窗口: {start_time.utc_datetime()} 到 {end_time.utc_datetime()}, 食甚: {max_time_utc}")
+        try:
+            Rm = 1737.4
+            def penumbra_thresh(ru, rp): return rp + Rm
+            def umbra_outer_thresh(ru, rp): return ru + Rm
+            def umbra_inner_thresh(ru, rp): return ru - Rm  # 允许负值
+
+            p_times, _ = self._find_crossings(start_time, end_time, penumbra_thresh)
+            uo_times, _ = self._find_crossings(start_time, end_time, umbra_outer_thresh)
+            ui_times, _ = self._find_crossings(start_time, end_time, umbra_inner_thresh)
+
+            print(f"半影交叉点: {len(p_times)} 个")
+            print(f"本影外缘交叉点: {len(uo_times)} 个")
+            print(f"本影内缘交叉点: {len(ui_times)} 个")
+
+            all_times = []
+            all_times.extend([(t, 'penumbral') for t in p_times])
+            all_times.extend([(t, 'umbral_outer') for t in uo_times])
+            all_times.extend([(t, 'umbral_inner') for t in ui_times])
+            all_times.sort(key=lambda x: x[0].utc_datetime())
+
+            print("所有交叉点时间 (UTC):")
+            for tt, typ in all_times:
+                print(f"  {typ}: {tt.utc_datetime()}")
+
+            if len(all_times) < 2:
+                print("错误: 交叉点少于2个，无法构成完整月食")
+                return None
+
+            # 阶段分配
+            stages = {}
+            pen_times = [t for t, typ in all_times if typ == 'penumbral']
+            if pen_times:
+                stages['penumbral_start'] = pen_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+                stages['penumbral_end']   = pen_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
+
+            uo_times = [t for t, typ in all_times if typ == 'umbral_outer']
+            if uo_times:
+                stages['umbral_start'] = uo_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+                stages['umbral_end']   = uo_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
+
+            ui_times = [t for t, typ in all_times if typ == 'umbral_inner']
+            if ui_times:
+                stages['total_start'] = ui_times[0].utc_datetime().replace(tzinfo=timezone.utc)
+                stages['total_end']   = ui_times[-1].utc_datetime().replace(tzinfo=timezone.utc)
+
+            stages['maximum'] = max_time_utc
+
+            # 如果 eclipselib 类型为月全食但几何法未检测到本影内缘，则手动添加近似点
+            if eclipselib_type == "月全食" and 'total_start' not in stages and 'umbral_start' in stages and 'umbral_end' in stages:
+                print("检测到月全食但无本影内缘，手动添加食既/生光近似点")
+                umbral_start = stages['umbral_start']
+                umbral_end = stages['umbral_end']
+                maximum = stages['maximum']
+                # 用初亏和食甚的中点作为食既，食甚和复圆的中点作为生光
+                total_start_approx = umbral_start + (maximum - umbral_start) * 0.5
+                total_end_approx = maximum + (umbral_end - maximum) * 0.5
+                stages['total_start'] = total_start_approx
+                stages['total_end'] = total_end_approx
+                print(f"添加后 stages 键: {stages.keys()}")
+
+            print("构建的 stages 字典:", stages.keys())
+
+            # 优先使用 eclipselib 传入的类型，若无则用几何推断
+            if eclipselib_type:
+                eclipse_type = eclipselib_type
+            elif 'total_start' in stages:
+                eclipse_type = "月全食"
+            elif 'umbral_start' in stages:
+                eclipse_type = "月偏食"
+            else:
+                eclipse_type = "半影月食"
+
+            # 构造事件字典
+            local_dt = max_time_utc.astimezone(self.local_tz)
+            stages_iso = {k: v.replace(microsecond=0).isoformat().replace('+00:00', 'Z') for k, v in stages.items()}
+            visible = self.is_moon_visible_at_time(max_time_utc)
+
+            eclipse_info = {
+                "time": max_time_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                "type": eclipse_type,
+                "time_utc": max_time_utc.replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
+                "time_local": local_dt.strftime("%Y年%m月%d日 %H:%M"),
+                "is_lunar": True,
+                "visible": "可见" if visible else "不可见",
+                "stages": stages_iso,
+                "start_utc": stages_iso.get('penumbral_start'),
+                "end_utc": stages_iso.get('penumbral_end')
+            }
+            return eclipse_info
+
+        except Exception as e:
+            print(f"计算月食细节异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def set_topmost(self, topmost):
         """设置窗口置顶状态"""
@@ -336,6 +576,11 @@ class MoonWidget:
                         eph = load(de421_path)
                         sun, moon, earth = eph['sun'], eph['moon'], eph['earth']
                         SKYFIELD_AVAILABLE = True
+                        # 将全局变量保存为实例属性，供几何方法使用
+                        self.ts = ts
+                        self.earth = earth
+                        self.sun = sun
+                        self.moon = moon
                         print("从本地加载星历数据成功")
                     else:
                         SKYFIELD_AVAILABLE = False
@@ -355,6 +600,11 @@ class MoonWidget:
                 
                 sun, moon, earth = eph['sun'], eph['moon'], eph['earth']
                 SKYFIELD_AVAILABLE = True
+                # 将全局变量保存为实例属性，供几何方法使用
+                self.ts = ts
+                self.earth = earth
+                self.sun = sun
+                self.moon = moon
                 print("Skyfield初始化完成")
                 
                 # 通知主线程初始化完成
@@ -391,7 +641,7 @@ class MoonWidget:
             # 尝试使用星历数据进行简单计算
             from skyfield.api import load
             test_ts = load.timescale()
-            test_time = test_ts.utc(datetime.now(timezone.utc))
+            test_time = test_ts.utc(get_current_time())
             
             # 尝试计算月球位置
             astrometric = eph['earth'].at(test_time).observe(eph['moon'])
@@ -589,7 +839,7 @@ class MoonWidget:
     
     def update_location_periodically(self):
         """每10秒更新一次位置信息，如果位置变化则更新可见性并立即重新计算月出月落"""
-        current_time = time.time()
+        current_time = get_current_timestamp()
         if current_time - self.last_ip_update >= 10:
             print("更新位置信息...")
             new_location = self.get_location()
@@ -642,7 +892,7 @@ class MoonWidget:
             observer = wgs84.latlon(self.location["latitude"], self.location["longitude"])
             
             # 获取当前时间（UTC）- 修复：使用有时区的时间
-            now_utc = datetime.now(timezone.utc)
+            now_utc = get_current_time()
             t0 = ts.utc(now_utc)
             
             # 计算未来72小时内的月出月落事件（增加时间范围）
@@ -832,7 +1082,7 @@ class MoonWidget:
     
     def update_moon_events_periodically(self):
         """每1分钟或位置变化时更新月出月落时间，每1小时更新月食信息"""
-        current_time = time.time()
+        current_time = get_current_timestamp()
         # 检查是否需要更新月出月落时间（1分钟或位置变化）
         if (current_time - self.last_moon_events_update >= 60 or  # 1分钟 = 60秒
             (self.location["latitude"] != self.last_location["latitude"] or 
@@ -925,7 +1175,7 @@ class MoonWidget:
         """检查月球是否可见（在地平线以上）"""
         try:
             # 修复：使用有时区的时间
-            now_local = datetime.now(timezone.utc).astimezone(self.local_tz)
+            now_local = get_local_time(self.local_tz)
             
             # 如果月球位置数据不可用，返回未知
             if not hasattr(self, 'last_moon_pos'):
@@ -999,7 +1249,7 @@ class MoonWidget:
                 raise Exception("星历数据未加载")
                 
             # 获取当前时间（UTC）
-            now_utc = datetime.now(timezone.utc)
+            now_utc = get_current_time()
             t = ts.utc(now_utc)
             
             # 创建观察者位置
@@ -1034,7 +1284,7 @@ class MoonWidget:
         """获取月球数据 - 使用Skyfield计算"""
         try:
             # 使用UTC时间进行计算 - 修复：使用有时区的时间
-            now_utc = datetime.now(timezone.utc)
+            now_utc = get_current_time()
             now_local = now_utc.astimezone(self.local_tz)  # 使用本地时区
             
             # 定期更新位置信息（每10秒）
@@ -1096,6 +1346,42 @@ class MoonWidget:
                 "skyfield_error": self.skyfield_error
             }
             
+            # 当前月食信息（若有）
+            current_eclipse = self.get_current_eclipse()
+            
+
+            # 在构造 moon_data 之后，返回之前
+            moon_data['current_time_utc'] = get_current_time().isoformat().replace('+00:00', 'Z')
+
+            current_eclipse = self.get_current_eclipse()
+            if current_eclipse:
+                # 深拷贝，避免修改原事件
+                current_eclipse_copy = current_eclipse.copy()
+                # 添加本地化阶段时间
+                stages_local = {}
+                for key, utc_str in current_eclipse_copy.get('stages', {}).items():
+                    try:
+                        dt = datetime.fromisoformat(utc_str.replace('Z', '+00:00'))
+                        stages_local[key] = dt.astimezone(self.local_tz).strftime("%Y年%m月%d日 %H:%M")
+                    except:
+                        stages_local[key] = utc_str
+                current_eclipse_copy['stages_local'] = stages_local
+                # 开始/结束时间本地化
+                try:
+                    start_dt = datetime.fromisoformat(current_eclipse_copy['start_utc'].replace('Z', '+00:00'))
+                    current_eclipse_copy['start_local'] = start_dt.astimezone(self.local_tz).strftime("%Y年%m月%d日 %H:%M")
+                except:
+                    current_eclipse_copy['start_local'] = current_eclipse_copy.get('start_utc', '')
+                try:
+                    end_dt = datetime.fromisoformat(current_eclipse_copy['end_utc'].replace('Z', '+00:00'))
+                    current_eclipse_copy['end_local'] = end_dt.astimezone(self.local_tz).strftime("%Y年%m月%d日 %H:%M")
+                except:
+                    current_eclipse_copy['end_local'] = current_eclipse_copy.get('end_utc', '')
+                moon_data['current_eclipse'] = current_eclipse_copy
+            else:
+                moon_data['current_eclipse'] = None
+
+
             return moon_data
         except Exception as e:
             print(f"计算月球数据错误: {e}")
@@ -1124,7 +1410,7 @@ class MoonWidget:
         """定期更新月球数据 - 每秒更新"""
         while self.is_running:
             # 获取当前时间的秒部分
-            current_second = datetime.now().second
+            current_second = get_current_time().second
             
             # 每秒更新一次
             moon_data = self.get_moon_data()
@@ -1202,6 +1488,70 @@ class MoonWidget:
                     justify-content: space-between;
                     margin-bottom: 8px;
                     font-size: 13px;
+                }
+                /* 当前月食显示区域 */
+                .current-eclipse {
+                    margin: 10px 0;
+                    padding: 10px;
+                    background: rgba(0, 0, 0, 0.3);
+                    border-radius: 8px;
+                }
+                .current-eclipse .title {
+                    text-align: center;
+                    font-weight: bold;
+                    margin-bottom: 8px;
+                    color: #ffaa00;
+                }
+                .current-eclipse .time-range {
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 11px;
+                    margin-bottom: 5px;
+                }
+                .current-eclipse .current-time {
+                    text-align: center;
+                    font-size: 12px;
+                    margin: 8px 0 5px;
+                }
+                .current-eclipse .stage {
+                    text-align: center;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: #ffaa00;
+                    margin-bottom: 10px;
+                }
+                .progress-container {
+                    position: relative;
+                    height: 20px;
+                    background: #333;
+                    border-radius: 10px;
+                    margin: 10px 0;
+                    overflow: visible;
+                }
+                .progress-bar {
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 10px;
+                    background: linear-gradient(to right, #888, #fff, #444, #000, #444, #fff, #888) !important;
+                }
+                .slider {
+                    position: absolute;
+                    top: -5px;
+                    width: 4px;
+                    height: 30px;
+                    background: white;
+                    border: 1px solid black;
+                    border-radius: 2px;
+                    transform: translateX(-50%);
+                    pointer-events: none;
+                    box-shadow: 0 0 5px gold;
+                }
+                .current-eclipse .eclipse-type {
+                    text-align: center;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: #ffaa00;
+                    margin-bottom: 5px;
                 }
                 .label {
                     font-weight: bold;
@@ -1414,6 +1764,21 @@ class MoonWidget:
             <!-- 月食信息区域 -->
             <div class="eclipse-section">
                 <div class="eclipse-header">未来月食</div>
+                <div id="current-eclipse-container" class="current-eclipse" style="display: none;">
+                    <div class="title">🌒 当前月食</div>
+                    <div class="eclipse-type" id="eclipse-type"></div>
+                    <div class="time-range">
+                        <span id="eclipse-start">--:--</span>
+                            -
+                        <span id="eclipse-end">--:--</span>
+                    </div>
+                    <div class="current-time" id="eclipse-current-time">当前时间: --:--</div>
+                    <div class="stage" id="eclipse-stage">--</div>
+                    <div class="progress-container" id="progress-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                        <div class="slider" id="progress-slider" style="left: 0%;"></div>
+                    </div>
+                </div>
                 <div id="eclipse-list">
                     <div class="no-eclipse">加载中...</div>
                 </div>
@@ -1479,7 +1844,8 @@ class MoonWidget:
                     
                     // 更新月食信息
                     updateEclipseData(data.eclipses || []);
-
+                    // 更新当前月食显示
+                    updateCurrentEclipse(data.current_eclipse, data.current_time_utc);
                     // 更新最后更新时间
                     const now = new Date();
                     document.getElementById('last-update').textContent = 
@@ -1519,6 +1885,180 @@ class MoonWidget:
                     document.getElementById('loading').style.display = 'none';
                 }
                 
+
+                
+                function updateCurrentEclipse(eclipse, currentTimeUtc) {
+                    const container = document.getElementById('current-eclipse-container');
+                    const eclipseList = document.getElementById('eclipse-list');
+                    if (!eclipse) {
+                        container.style.display = 'none';
+                        eclipseList.style.display = 'block';
+                        return;
+                    }
+
+                    container.style.display = 'block';
+                    eclipseList.style.display = 'none';
+
+                    // 显示月食类型
+                    document.getElementById('eclipse-type').textContent = eclipse.type || '月食';
+
+                    // 显示开始/结束时间（本地化格式）
+                    document.getElementById('eclipse-start').textContent = eclipse.start_local || eclipse.start_utc || '--';
+                    document.getElementById('eclipse-end').textContent = eclipse.end_local || eclipse.end_utc || '--';
+
+                    // 当前时间显示（从主界面获取）
+                    const nowLocal = document.getElementById('time').textContent;
+                    document.getElementById('eclipse-current-time').textContent = `当前时间: ${nowLocal}`;
+
+                    // 阶段名称和颜色映射
+                    const stageNames = {
+                        'penumbral_start': '半影食始',
+                        'penumbral_end':   '半影食终',
+                        'umbral_start':    '初亏',
+                        'umbral_end':      '复圆',
+                        'total_start':     '食既',
+                        'total_end':       '生光',
+                        'maximum':         '食甚',
+                        'greatest':        '食甚',
+                        'maximum_eclipse': '食甚'
+                    };
+
+                    const stageColors = {
+                        'penumbral_start': '#888888',
+                        'penumbral_end':   '#888888',
+                        'umbral_start':    '#ffffff',
+                        'umbral_end':      '#ffffff',
+                        'total_start':     '#000000',
+                        'total_end':       '#000000',
+                        'maximum':         '#b87333',  // 改为古铜色
+                        'greatest':        '#b87333',
+                        'maximum_eclipse': '#b87333'
+                    };
+
+                    // 解析阶段时间
+                    const stages = eclipse.stages || {};
+                    console.log('Raw stages:', stages);
+                    const stageList = [];
+                    for (const [key, utcStr] of Object.entries(stages)) {
+                        const dt = new Date(utcStr);
+                        if (!isNaN(dt)) {
+                            stageList.push({
+                                key: key,
+                                time: dt,
+                                label: stageNames[key] || key,
+                                color: stageColors[key] || '#888888'
+                            });
+                        }
+                    }
+                    stageList.sort((a, b) => a.time - b.time);
+                    console.log('Sorted stageList:', stageList);
+
+                    // 获取整体开始/结束时间
+                    let startTime, endTime;
+                    try {
+                        startTime = new Date(eclipse.start_utc);
+                        endTime = new Date(eclipse.end_utc);
+                    } catch (e) {
+                        if (stageList.length > 0) {
+                            startTime = stageList[0].time;
+                            endTime = stageList[stageList.length-1].time;
+                        } else {
+                            const now = new Date(currentTimeUtc);
+                            startTime = new Date(now.getTime() - 3600000);
+                            endTime = new Date(now.getTime() + 3600000);
+                        }
+                    }
+                    if (!startTime || !endTime || startTime >= endTime) {
+                        const now = new Date(currentTimeUtc);
+                        startTime = new Date(now.getTime() - 3600000);
+                        endTime = new Date(now.getTime() + 3600000);
+                    }
+
+                    const totalDuration = endTime - startTime;
+                    const now = new Date(currentTimeUtc);
+
+                    // 确定当前阶段
+                    let currentStage = '未知';
+                    if (stageList.length === 0) {
+                        currentStage = '月食进行中';
+                    } else {
+                        let found = false;
+                        for (let i = 0; i < stageList.length; i++) {
+                            if (stageList[i].time > now) {
+                                if (i === 0) {
+                                    currentStage = '即将开始';
+                                } else {
+                                    currentStage = `${stageList[i-1].label} → ${stageList[i].label}`;
+                                }
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            currentStage = stageList[stageList.length-1].label + ' 后';
+                        }
+                    }
+                    document.getElementById('eclipse-stage').textContent = currentStage;
+
+                    // 滑块位置
+                    let percent = 0;
+                    if (startTime < endTime) {
+                        percent = (now - startTime) / totalDuration * 100;
+                        percent = Math.min(100, Math.max(0, percent));
+                        document.getElementById('progress-slider').style.left = percent + '%';
+                    }
+
+                    // 构建渐变背景
+                    // 构建渐变背景
+                    let stops = [
+                        { pos: 0, color: stageColors['penumbral_start'] || '#888888' }
+                    ];
+
+                    // 设置食甚显示宽度（百分比）
+                    const MAXIMUM_WIDTH =10; // 可根据需要调整，0.8% 的宽度通常足够显眼
+
+                    for (let stage of stageList) {
+                        let pos = (stage.time - startTime) / totalDuration * 100;
+                        pos = Math.min(100, Math.max(0, pos));
+                        
+                        if (stage.key === 'maximum') {
+                            // 为食甚创建两个相邻的点，形成一个颜色平台
+                            let halfWidth = MAXIMUM_WIDTH / 2;
+                            let posStart = Math.max(0, pos - halfWidth);
+                            let posEnd = Math.min(100, pos + halfWidth);
+                            stops.push({ pos: posStart, color: stage.color });
+                            stops.push({ pos: posEnd, color: stage.color });
+                        } else {
+                            stops.push({ pos: pos, color: stage.color });
+                        }
+                    }
+                    stops.push({ pos: 100, color: stageColors['penumbral_end'] || '#888888' });
+
+                    // 去重并排序（保持原有逻辑）
+                    stops.sort((a, b) => a.pos - b.pos);
+                    let uniqueStops = [];
+                    for (let i = 0; i < stops.length; i++) {
+                        if (i === 0 || stops[i].pos !== stops[i-1].pos) {
+                            uniqueStops.push(stops[i]);
+                        }
+                    }
+
+                    let gradientStr = 'linear-gradient(to right';
+                    for (let stop of uniqueStops) {
+                        gradientStr += `, ${stop.color} ${stop.pos}%`;
+                    }
+                    gradientStr += ')';
+                    console.log('Gradient string:', gradientStr);
+
+                    // 应用渐变
+                    const progressBar = document.getElementById('progress-bar');
+                    progressBar.style.background = gradientStr;
+                    progressBar.style.backgroundRepeat = 'no-repeat';
+
+                    // 强制确保容器显示
+                    container.style.display = 'block';
+                    eclipseList.style.display = 'none';
+                }
 
                 function updateEclipseData(eclipses) {
                     const eclipseList = document.getElementById('eclipse-list');
@@ -1583,9 +2123,9 @@ class MoonWidget:
                     visibility: "--",
                     phase: 0,
                     skyfield_available: true,
-                    eclipses: []
+                    eclipses: [],
+                    current_eclipse: null
                 });
-
 
             </script>
         </body>
@@ -1605,7 +2145,8 @@ class MoonWidget:
             transparent=True,
             focus=False    # 不获取焦点
         )
-        
+
+
         # 绑定关闭方法
         self.window.expose(self.close_app, self.set_topmost)
     
@@ -1674,8 +2215,71 @@ class MoonWidget:
         eclipse_thread.daemon = True
         eclipse_thread.start()
         
-        # 启动WebView
-        webview.start(debug=False)
+        # 延迟打开开发者工具（调试用）
+        def open_devtools():
+            import time
+            time.sleep(2)  # 等待窗口完全加载
+            try:
+                self.window.evaluate_js("window.pywebview.api.open_devtools()")
+                print("开发者工具已打开")
+            except Exception as e:
+                print(f"打开开发者工具失败: {e}")
+        
+        
+        
+        # 启动WebView（阻塞）
+        webview.start(debug=False, gui='edgechromium')  # 使用EdgeHTML引擎，调试模式开启
+    
+
+    def _shadow_geometry(self, t):
+        """返回 (月球到地影轴距离, 本影半径, 半影半径) 单位：公里"""
+        # 计算地-日、地-月矢量（km）
+        r_es = self.sun.at(t).position.km - self.earth.at(t).position.km
+        r_em = self.moon.at(t).position.km - self.earth.at(t).position.km
+
+        d_es = (r_es ** 2).sum() ** 0.5
+        d_em = (r_em ** 2).sum() ** 0.5
+
+        # 阴影轴方向：从地球指向反太阳方向
+        axis = - r_es / d_es
+        # 月心到轴线的垂直距离
+        proj = (r_em * axis).sum()
+        perp = r_em - proj * axis
+        dist_axis = (perp ** 2).sum() ** 0.5
+
+        # 本影/半影半径在该距离处的几何值
+        Re = 6378.137
+        Rs = 695700.0
+        r_umbra = Re - Rs * (d_em / d_es)        # 本影半径
+        r_penumbra = Re + Rs * (d_em / d_es)     # 半影半径
+
+
+        # print(f"d_es={d_es:.0f} km, d_em={d_em:.0f} km, dist_axis={dist_axis:.0f}, r_umbra={r_umbra:.0f}, r_penumbra={r_penumbra:.0f}")
+
+        return dist_axis, r_umbra, r_penumbra
+
+    def _find_crossings(self, t0, t1, radius_func):
+        """查找距离与给定阈值半径（含月球半径）的交叉时刻"""
+        from skyfield import searchlib
+        import numpy as np
+
+        def state(t):
+            try:
+                # 处理时间数组
+                results = []
+                for ti in t:
+                    da, ru, rp = self._shadow_geometry(ti)
+                    thresh = radius_func(ru, rp)
+                    results.append(da <= thresh)
+                return np.array(results, dtype=bool)
+            except TypeError:
+                # 单个时间
+                da, ru, rp = self._shadow_geometry(t)
+                thresh = radius_func(ru, rp)
+                return da <= thresh
+
+        state.step_days = 0.004  # 采样间隔
+        return searchlib.find_discrete(t0, t1, state)
 
 if __name__ == '__main__':
     # 如果设置了隐藏控制台，则尝试隐藏
